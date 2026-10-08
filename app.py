@@ -99,7 +99,7 @@ def ayuda():
 def error_mongo(error):
     return render_template(
         "error.html",
-        mensaje="No fue posible conectar con la base de datos. Revisa la configuración y vuelve a intentar."
+        mensaje="No fue posible conectar con la base de datos. Revisa la configuración y vuelve a intentar. "
     ), 503
 
 
