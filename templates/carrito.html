@@ -1,0 +1,19 @@
+{% extends 'base_tienda.html' %}
+{% block titulo %}Tu carrito · Tienda Estilo Moda{% endblock %}
+{% block contenido %}
+<section class="container py-4 py-lg-5">
+  <p class="eyebrow">TU SELECCIÓN</p><h1 class="display-6 fw-bold mb-4">Carrito de compra</h1>
+  {% if articulos %}
+    <div class="row g-4 align-items-start">
+      <div class="col-lg-8"><div class="cart-list">
+        {% for item in articulos %}<article class="cart-row">
+          <a class="cart-thumb" href="{{ url_for('detalle_producto', id=item._id) }}">{% if item.get('imagen') %}<img src="{{ item.imagen }}" alt="{{ item.nombre }}">{% else %}<img src="{{ url_for('static', filename='img/producto-placeholder.svg') }}" alt="Streetwear">{% endif %}</a>
+          <div class="cart-item-main"><a href="{{ url_for('detalle_producto', id=item._id) }}" class="fw-bold text-decoration-none text-dark">{{ item.nombre }}</a><p class="small text-secondary mb-2">{{ item.categoria }} · {{ item.precio|moneda }} por unidad</p><div class="d-flex flex-wrap align-items-center gap-2"><form method="post" action="{{ url_for('actualizar_carrito', id=item._id) }}" class="d-flex align-items-center gap-2"><label for="qty-{{ item._id }}" class="small text-secondary">Cantidad</label><input id="qty-{{ item._id }}" type="number" name="cantidad" value="{{ item.cantidad }}" min="1" max="10" class="form-control form-control-sm" style="width: 78px;"><button class="btn btn-outline-dark btn-sm" type="submit">Actualizar</button></form><form method="post" action="{{ url_for('eliminar_carrito', id=item._id) }}"><button class="btn btn-link btn-sm text-danger p-0" type="submit">Quitar</button></form></div></div>
+          <div class="cart-subtotal fw-bold">{{ item.subtotal|moneda }}</div>
+        </article>{% endfor %}
+      </div><a href="{{ url_for('tienda') }}#catalogo" class="btn btn-link text-dark px-0 mt-3">← Seguir explorando</a></div>
+      <div class="col-lg-4"><aside class="order-summary"><p class="eyebrow">RESUMEN</p><h2 class="h5 fw-bold">Tu pedido</h2><div class="summary-line"><span>Productos ({{ carrito_cantidad }})</span><span>{{ total|moneda }}</span></div><div class="summary-line"><span>Envío</span><span>Demo</span></div><hr><div class="summary-line summary-total"><span>Total estimado</span><span>{{ total|moneda }}</span></div><a href="{{ url_for('checkout') }}" class="btn btn-dark btn-lg w-100 mt-3">Continuar al checkout</a><p class="small text-secondary mt-3 mb-0">Sin cobros reales. El checkout solo crea un pedido de prueba.</p></aside></div>
+    </div>
+  {% else %}<div class="empty-shop text-center py-5 px-3"><div class="empty-mark">TSM.</div><h2 class="h4 fw-bold mt-3">Tu carrito está vacío</h2><p class="text-secondary">Encuentra una pieza para tu próximo look.</p><a class="btn btn-dark" href="{{ url_for('tienda') }}#catalogo">Ver catálogo</a></div>{% endif %}
+</section>
+{% endblock %}

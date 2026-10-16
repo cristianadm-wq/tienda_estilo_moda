@@ -1,0 +1,18 @@
+{% extends 'base_tienda.html' %}
+{% block titulo %}Checkout simulado · Tienda Estilo Moda{% endblock %}
+{% block contenido %}
+<section class="container py-4 py-lg-5">
+  <p class="eyebrow">ÚLTIMO PASO · DEMO</p><h1 class="display-6 fw-bold mb-4">Confirmar pedido</h1>
+  <div class="row g-4 align-items-start">
+    <div class="col-lg-7"><div class="checkout-panel"><div class="alert alert-warning" role="alert"><strong>Pago simulado:</strong> esta pantalla no cobra dinero. No introduzcas datos de tarjetas bancarias.</div>
+      <form method="post" action="{{ url_for('confirmar_checkout') }}" class="row g-3">
+        <div class="col-12"><label for="nombre" class="form-label">Nombre de quien realiza el pedido</label><input id="nombre" name="nombre" class="form-control" maxlength="100" required autocomplete="name"></div>
+        <div class="col-12"><label for="correo" class="form-label">Correo de demostración</label><input id="correo" name="correo" type="email" class="form-control" maxlength="160" required autocomplete="email" placeholder="tu@email.com"></div>
+        <div class="col-12"><label class="form-label">Método de pago</label><input class="form-control" value="Pago simulado (sin cobro)" readonly><div class="form-text">No pedimos número de tarjeta, CVV ni contraseñas.</div></div>
+        <div class="col-12 d-flex flex-wrap gap-2 mt-3"><button class="btn btn-dark btn-lg" type="submit">Confirmar pedido de prueba</button><a class="btn btn-outline-secondary btn-lg" href="{{ url_for('ver_carrito') }}">Volver al carrito</a></div>
+      </form>
+    </div></div>
+    <div class="col-lg-5"><aside class="order-summary"><p class="eyebrow">RESUMEN DEL PEDIDO</p>{% for item in articulos %}<div class="summary-line"><span>{{ item.nombre }} × {{ item.cantidad }}</span><span>{{ item.subtotal|moneda }}</span></div>{% endfor %}<hr><div class="summary-line summary-total"><span>Total</span><span>{{ total|moneda }}</span></div></aside></div>
+  </div>
+</section>
+{% endblock %}

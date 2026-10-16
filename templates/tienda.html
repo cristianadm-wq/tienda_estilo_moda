@@ -1,0 +1,44 @@
+{% extends 'base_tienda.html' %}
+{% block titulo %}Tienda Estilo Moda · Sneakers & Streetwear{% endblock %}
+{% block contenido %}
+<section class="store-hero">
+  <div class="container hero-content">
+    <div class="row align-items-center g-4">
+      <div class="col-lg-7">
+        <span class="hero-kicker">STREETWEAR / EVERYDAY UNIFORM</span>
+        <h1 class="display-3 fw-bold hero-title">Tu estilo.<br><span>Sin reglas.</span></h1>
+        <p class="hero-copy">Sneakers, prendas esenciales y accesorios para construir tu propio look.</p>
+        <div class="d-flex flex-wrap gap-2 mt-4"><a class="btn btn-light btn-lg px-4" href="#catalogo">Explorar catálogo</a><a class="btn btn-outline-light btn-lg px-4" href="{{ url_for('ver_carrito') }}">Ver carrito · {{ carrito_cantidad }}</a></div>
+      </div>
+      <div class="col-lg-5 d-none d-lg-block"><div class="hero-art"><div class="hero-art-ring"></div><div class="hero-art-label">DROP<br>YOUR<br>OWN<br>RULES<span>.</span></div><div class="hero-art-tag">TSM / 001</div></div></div>
+    </div>
+  </div>
+</section>
+<section class="container py-5" id="catalogo">
+  <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-end gap-3 mb-4">
+    <div><p class="eyebrow mb-1">SELECCIÓN TSM</p><h2 class="section-title mb-1">Piezas para rotar.</h2><p class="text-secondary mb-0">Productos disponibles, listos para descubrir.</p></div>
+    <form class="search-form d-flex gap-2" method="get" action="{{ url_for('tienda') }}"><label class="visually-hidden" for="q">Buscar producto</label><input class="form-control" id="q" name="q" type="search" value="{{ busqueda }}" placeholder="Buscar sneakers, hoodies…"><button class="btn btn-dark" type="submit">Buscar</button></form>
+  </div>
+  {% if busqueda %}<p class="small text-secondary">Resultados para: <strong>{{ busqueda }}</strong> · <a class="text-dark" href="{{ url_for('tienda') }}#catalogo">Limpiar búsqueda</a></p>{% endif %}
+  <div class="row g-4">
+    {% for producto in productos %}
+      <div class="col-12 col-sm-6 col-xl-4">
+        <article class="product-card h-100">
+          <a href="{{ url_for('detalle_producto', id=producto._id) }}" class="product-media d-block" aria-label="Ver {{ producto.nombre }}">
+            {% if producto.get('imagen') %}<img src="{{ producto.imagen }}" alt="{{ producto.nombre }}" loading="lazy">{% else %}<img src="{{ url_for('static', filename='img/producto-placeholder.svg') }}" alt="Imagen ilustrativa de streetwear" loading="lazy">{% endif %}
+            <span class="product-category">{{ producto.categoria }}</span>
+          </a>
+          <div class="product-info p-3 p-lg-4">
+            <div class="d-flex align-items-start justify-content-between gap-2"><h3 class="h5 product-name mb-1"><a class="text-decoration-none text-dark" href="{{ url_for('detalle_producto', id=producto._id) }}">{{ producto.nombre }}</a></h3><span class="availability-dot" title="Disponible"></span></div>
+            <p class="text-secondary small mb-3">{{ producto.get('descripcion', 'Prenda o accesorio streetwear.') }}</p>
+            <div class="d-flex justify-content-between align-items-center gap-2"><span class="product-price">{% if producto.precio > 0 %}{{ producto.precio|moneda }}{% else %}Precio pendiente{% endif %}</span><a class="btn btn-outline-dark btn-sm" href="{{ url_for('detalle_producto', id=producto._id) }}">Ver producto ↗</a></div>
+          </div>
+        </article>
+      </div>
+    {% else %}
+      <div class="col-12"><div class="empty-shop text-center py-5 px-3"><div class="empty-mark">TSM.</div><h3 class="h4 fw-bold mt-3">El catálogo está preparando el siguiente drop.</h3><p class="text-secondary mx-auto" style="max-width: 460px;">Aún no hay productos disponibles. Agrega productos desde el panel de administración para que aparezcan aquí.</p><a class="btn btn-dark mt-2" href="{{ url_for('inicio') }}">Abrir administración</a></div></div>
+    {% endfor %}
+  </div>
+</section>
+<section class="container pb-5"><div class="shipping-strip"><div><span class="eyebrow">COMPRA DE DEMOSTRACIÓN</span><h2 class="h4 fw-bold mb-1">Explora. Elige. Combina.</h2><p class="mb-0 text-secondary">El checkout es simulado: esta práctica no realiza cobros reales.</p></div><a href="{{ url_for('ayuda') }}" class="btn btn-outline-dark">Cómo funciona</a></div></section>
+{% endblock %}

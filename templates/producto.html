@@ -1,0 +1,23 @@
+{% extends 'base_tienda.html' %}
+{% block titulo %}{{ producto.nombre }} · Tienda Estilo Moda{% endblock %}
+{% block contenido %}
+<section class="container py-4 py-lg-5">
+  <nav aria-label="breadcrumb" class="mb-4"><ol class="breadcrumb small"><li class="breadcrumb-item"><a href="{{ url_for('tienda') }}">Tienda</a></li><li class="breadcrumb-item active" aria-current="page">{{ producto.nombre }}</li></ol></nav>
+  <div class="row g-4 g-lg-5 align-items-start">
+    <div class="col-lg-6"><div class="detail-image">{% if producto.get('imagen') %}<img src="{{ producto.imagen }}" alt="{{ producto.nombre }}">{% else %}<img src="{{ url_for('static', filename='img/producto-placeholder.svg') }}" alt="Imagen ilustrativa de streetwear">{% endif %}</div></div>
+    <div class="col-lg-6 detail-panel">
+      <p class="eyebrow">{{ producto.categoria }} · TSM SELECT</p><h1 class="display-5 fw-bold">{{ producto.nombre }}</h1>
+      <p class="detail-price">{% if producto.precio > 0 %}{{ producto.precio|moneda }}{% else %}Precio pendiente{% endif %}</p>
+      <p class="text-secondary">{{ producto.get('descripcion', 'Prenda o accesorio streetwear.') }}</p>
+      <div class="detail-divider my-4"></div>
+      <p class="small mb-4">Estado: {% if producto.estado == 'Disponible' %}<span class="badge text-bg-success">Disponible</span>{% else %}<span class="badge text-bg-secondary">{{ producto.estado }}</span>{% endif %}</p>
+      {% if producto.estado == 'Disponible' and producto.precio > 0 %}
+        <form action="{{ url_for('agregar_carrito', id=producto._id) }}" method="post" class="d-flex flex-wrap align-items-end gap-3"><div><label for="cantidad" class="form-label small">Cantidad</label><input id="cantidad" name="cantidad" class="form-control" type="number" min="1" max="10" value="1" required style="width: 100px;"></div><button type="submit" class="btn btn-dark btn-lg">Agregar al carrito</button></form>
+      {% elif producto.estado != 'Disponible' %}<div class="alert alert-light border">Este producto no está disponible por el momento.</div>
+      {% else %}<div class="alert alert-warning">El panel de administración debe asignarle un precio antes de venderlo.</div>{% endif %}
+      <p class="text-secondary small mt-4">Pago de demostración. No se solicitan datos bancarios ni se realiza ningún cobro.</p>
+    </div>
+  </div>
+  {% if relacionados %}<section class="mt-5 pt-4"><p class="eyebrow">TAMBIÉN TE PUEDE GUSTAR</p><div class="row g-3">{% for p in relacionados %}<div class="col-6 col-lg-3"><a class="related-product" href="{{ url_for('detalle_producto', id=p._id) }}">{% if p.get('imagen') %}<img src="{{ p.imagen }}" alt="{{ p.nombre }}">{% else %}<img src="{{ url_for('static', filename='img/producto-placeholder.svg') }}" alt="Streetwear">{% endif %}<span class="fw-semibold d-block mt-2">{{ p.nombre }}</span><span class="small text-secondary">{{ p.precio|moneda }}</span></a></div>{% endfor %}</div></section>{% endif %}
+</section>
+{% endblock %}

@@ -1,22 +1,15 @@
 {% extends 'base.html' %}
+{% block titulo %}Ayuda · Tienda Estilo Moda{% endblock %}
+{% block encabezado %}Centro de ayuda{% endblock %}
+{% block bajada %}Guía rápida para la tienda y su panel de inventario.{% endblock %}
 {% block contenido %}
-<section class="card shadow-sm">
-<div class="card-body p-4">
-<h2 class="h4">Ayuda del registro</h2>
-<p class="text-secondary">Fecha del equipo: {{ fecha }}</p>
-<div class="alert alert-info" role="note">
-Utiliza datos ficticios durante la práctica.
-</div>
-<ol class="mb-4">
-<li>En Registrar, escribe nombre, grupo y selecciona turno.</li>
-<li>Presiona Guardar alumno y consulta la lista.</li>
-<li>Usa Editar para corregir los datos de un alumno.</li>
-<li>Usa Eliminar solo con tus registros de prueba.</li>
-<li>En pantalla pequeña, abre el menú con su botón.</li>
-</ol>
-<a class="btn btn-primary" href="{{ url_for('inicio') }}">
-Volver al registro
-</a>
-</div>
-</section>
+<section class="card admin-card shadow-sm"><div class="card-body p-4 p-lg-5">
+  <p class="text-secondary">Fecha del equipo: {{ fecha }}</p>
+  <div class="alert alert-info" role="note">Utiliza solo datos ficticios durante esta práctica. El checkout no procesa cobros reales.</div>
+  <h2 class="h5 fw-bold">Para administrar productos</h2>
+  <ol><li>Abre el panel de inventario desde el menú.</li><li>Escribe nombre, categoría, estado, precio y, si quieres, descripción e imagen.</li><li>Pulsa Guardar producto para agregarlo al catálogo.</li><li>Usa Editar para actualizar sus datos y Eliminar únicamente con productos de prueba.</li></ol>
+  <h2 class="h5 fw-bold mt-4">Para probar la tienda</h2>
+  <ol><li>Entra en Ver tienda y abre la ficha de un producto disponible.</li><li>Agrégalo al carrito y revisa las cantidades.</li><li>Continúa al checkout y confirma el pedido simulado.</li></ol>
+  <div class="d-flex flex-wrap gap-2 mt-4"><a class="btn btn-dark" href="{{ url_for('tienda') }}">Volver a la tienda</a><a class="btn btn-outline-dark" href="{{ url_for('inicio') }}">Abrir inventario</a></div>
+</div></section>
 {% endblock %}
