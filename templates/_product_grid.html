@@ -1,0 +1,19 @@
+<div class="row g-4">
+{% for producto in productos %}
+  <div class="col-12 col-sm-6 col-xl-4"><article class="product-card h-100">
+    <a href="{{ url_for('detalle_producto', id=producto._id) }}" class="product-media d-block" aria-label="Ver {{ producto.nombre }}">
+      {% if producto.imagen %}<img src="{{ producto.imagen }}" alt="{{ producto.nombre }}" loading="lazy">{% else %}<img src="{{ url_for('static', filename='img/producto-placeholder.svg') }}" alt="Imagen ilustrativa de streetwear" loading="lazy">{% endif %}
+      <span class="product-category">{{ producto.categoria }}</span>
+      <span class="product-badges">{% if producto.es_nuevo %}<span class="badge-tag badge-new">NUEVO</span>{% endif %}{% if producto.en_oferta %}<span class="badge-tag badge-sale">SALE −{{ producto.porcentaje_descuento }}%</span>{% endif %}{% if producto.estado != 'Disponible' %}<span class="badge-tag badge-out">AGOTADO</span>{% endif %}</span>
+    </a>
+    <div class="product-info p-3 p-lg-4">
+      <div class="d-flex justify-content-between align-items-start gap-2"><h3 class="h5 product-name mb-1"><a class="text-decoration-none text-dark" href="{{ url_for('detalle_producto', id=producto._id) }}">{{ producto.nombre }}</a></h3>
+      {% if usuario_actual %}<form action="{{ url_for('alternar_favorito', id=producto._id) }}" method="post" class="m-0"><input type="hidden" name="csrf_token" value="{{ csrf_token() }}"><input type="hidden" name="next" value="{{ next_url if next_url else '/' }}"><button class="favorite-button {% if producto._id|string in favoritos_ids %}is-favorite{% endif %}" type="submit" aria-label="{% if producto._id|string in favoritos_ids %}Quitar de favoritos{% else %}Agregar a favoritos{% endif %}" title="Favoritos">{% if producto._id|string in favoritos_ids %}♥{% else %}♡{% endif %}</button></form>{% else %}<a class="favorite-button" href="{{ url_for('login', next='/favoritos') }}" aria-label="Inicia sesión para guardar favoritos" title="Inicia sesión para guardar favoritos">♡</a>{% endif %}</div>
+      <p class="text-secondary small mb-2">{{ producto.descripcion }}</p>
+      {% if producto.drop_pendiente %}<div class="small drop-countdown mb-2" data-countdown="{{ producto.drop_at_iso }}">Calculando lanzamiento…</div>{% endif %}
+      <div class="d-flex justify-content-between align-items-center gap-2"><div>{% if producto.precio > 0 %}<span class="product-price">{{ producto.precio|moneda }}</span>{% if producto.en_oferta %}<div class="small text-secondary text-decoration-line-through">{{ producto.precio_original|moneda }}</div>{% endif %}{% else %}<span class="product-price">Precio pendiente</span>{% endif %}</div><a class="btn btn-outline-dark btn-sm" href="{{ url_for('detalle_producto', id=producto._id) }}">Ver producto ↗</a></div>
+      <div class="small mt-3 {% if producto.estado == 'Disponible' and not producto.drop_pendiente %}text-success{% else %}text-secondary{% endif %}">{% if producto.drop_pendiente %}Próximo lanzamiento{% elif producto.estado == 'Disponible' %}Disponible · {{ producto.stock }} unidad(es){% else %}Agotado{% endif %}</div>
+    </div>
+  </article></div>
+{% else %}<div class="col-12"><div class="empty-shop text-center py-5 px-3"><div class="empty-mark">TSM.</div><h3 class="h4 fw-bold mt-3">No encontramos piezas con esos filtros.</h3><p class="text-secondary mx-auto" style="max-width:460px">Prueba otra búsqueda o limpia los filtros para ver todo el catálogo.</p><a class="btn btn-dark mt-2" href="{{ url_for('tienda') }}#catalogo">Ver catálogo completo</a></div></div>{% endfor %}
+</div>

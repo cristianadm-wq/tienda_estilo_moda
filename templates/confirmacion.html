@@ -1,10 +1,2 @@
-{% extends 'base_tienda.html' %}
-{% block titulo %}Pedido de prueba confirmado · Tienda Estilo Moda{% endblock %}
-{% block contenido %}
-<section class="container py-5"><div class="confirmation-card text-center mx-auto">
-  <div class="confirmation-icon">✓</div><p class="eyebrow mt-4">PEDIDO DE DEMOSTRACIÓN</p><h1 class="display-6 fw-bold">¡Listo, {{ pedido.cliente.nombre }}!</h1>
-  <p class="text-secondary">Tu pedido de prueba se registró correctamente. No se realizó ningún cobro ni se procesó información bancaria.</p>
-  <div class="order-reference"><span class="small text-secondary d-block">Referencia del pedido</span><code>{{ pedido._id }}</code><hr><div class="d-flex justify-content-between align-items-center"><span>Total simulado</span><strong>{{ pedido.total|moneda }}</strong></div><div class="d-flex justify-content-between align-items-center mt-2"><span>Estado</span><span class="badge text-bg-secondary">Pago no realizado</span></div></div>
-  <a class="btn btn-dark btn-lg mt-4" href="{{ url_for('tienda') }}">Volver a la tienda</a>
-</div></section>
-{% endblock %}
+{% extends 'base_tienda.html' %}{% block titulo %}Pedido creado · Tienda Estilo Moda{% endblock %}{% block contenido %}
+<section class="container py-5"><div class="confirmation-card mx-auto text-center"><div class="confirmation-icon">✓</div><p class="eyebrow mt-4">PEDIDO REGISTRADO</p><h1 class="h2 fw-bold">¡Listo! Tu pedido de prueba está creado.</h1><p class="text-secondary">No se realizó ningún cobro. Este pedido se guardó para que puedas probar el historial y el panel administrativo.</p><div class="order-reference"><div class="small text-secondary">Número de pedido</div><strong>{{ pedido._id }}</strong><hr><div class="summary-line"><span>Estado</span><strong>{{ pedido.estado_pedido or 'Recibido' }}</strong></div><div class="summary-line"><span>Método</span><span>{{ pedido.metodo_pago }}</span></div>{% if pedido.cupon_codigo %}<div class="summary-line"><span>Cupón</span><span>{{ pedido.cupon_codigo }}</span></div>{% endif %}<div class="summary-line summary-total"><span>Total de demostración</span><span>{{ pedido.total|moneda }}</span></div></div><div class="d-flex flex-wrap justify-content-center gap-2 mt-4"><a class="btn btn-dark" href="{{ url_for('mis_pedidos') }}">Ver mis pedidos</a><a class="btn btn-outline-dark" href="{{ url_for('tienda') }}">Volver a la tienda</a></div></div></section>{% endblock %}

@@ -1,0 +1,12 @@
+{% extends 'base_tienda.html' %}{% block titulo %}Detalle del pedido · Tienda Estilo Moda{% endblock %}{% block contenido %}<section class="container py-5"><p class="eyebrow">PEDIDO</p><h1 class="section-title">Detalle del pedido</h1><div class="order-summary mt-4"><div class="summary-line"><span>Referencia</span><code>{{ pedido._id }}</code></div><div class="summary-line">
+    <span>Fecha</span><span>{{ pedido.creado_en|fecha_corta }}</span></div><div class="summary-line"><span>
+        Cliente</span><span>{{ pedido.cliente.nombre }}</span></div><div class="summary-line"><span>
+            Correo</span><span>{{ pedido.cliente.correo }}</span></div><div class="summary-line"><span>Estado
+
+            </span><strong>{{ pedido.estado_pedido or 'Recibido' }}</strong></div><div class="summary-line"><span>Pago</span><span>{{ pedido.estado_pago }}</span></div><hr><h2 class="h5">Productos</h2>{% for item in pedido['items'] %}<div class="summary-line"><span>{{ item.nombre }} × {{ item.cantidad }}{% if item.talla %}<small class="d-block text-secondary">Talla
+                 {{ item.talla }} · Color {{ item.color }}
+
+            </small>{% endif %}</span><span>{{ item.subtotal|moneda }}</span></div>{% endfor %}<hr><div
+             class="summary-line"><span>Subtotal</span><span>{{ pedido.subtotal|default(pedido.total)|moneda }}</span></div>{% if pedido.descuento %}<div class="summary-line 
+             text-success"><span>Descuento</span><span>−{{ pedido.descuento|moneda }}</span></div>{% endif %}<div
+              class="summary-line summary-total"><span>Total</span><span>{{ pedido.total|moneda }}</span></div></div><a class="btn btn-outline-dark mt-3" href="{{ url_for('mis_pedidos') }}">Volver a mis pedidos</a></section>{% endblock %}

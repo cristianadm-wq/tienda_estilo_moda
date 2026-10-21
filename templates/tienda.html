@@ -1,44 +1,21 @@
 {% extends 'base_tienda.html' %}
 {% block titulo %}Tienda Estilo Moda · Sneakers & Streetwear{% endblock %}
 {% block contenido %}
-<section class="store-hero">
-  <div class="container hero-content">
-    <div class="row align-items-center g-4">
-      <div class="col-lg-7">
-        <span class="hero-kicker">STREETWEAR / EVERYDAY UNIFORM</span>
-        <h1 class="display-3 fw-bold hero-title">Tu estilo.<br><span>Sin reglas.</span></h1>
-        <p class="hero-copy">Sneakers, prendas esenciales y accesorios para construir tu propio look.</p>
-        <div class="d-flex flex-wrap gap-2 mt-4"><a class="btn btn-light btn-lg px-4" href="#catalogo">Explorar catálogo</a><a class="btn btn-outline-light btn-lg px-4" href="{{ url_for('ver_carrito') }}">Ver carrito · {{ carrito_cantidad }}</a></div>
-      </div>
-      <div class="col-lg-5 d-none d-lg-block"><div class="hero-art"><div class="hero-art-ring"></div><div class="hero-art-label">DROP<br>YOUR<br>OWN<br>RULES<span>.</span></div><div class="hero-art-tag">TSM / 001</div></div></div>
-    </div>
-  </div>
-</section>
-<section class="container py-5" id="catalogo">
-  <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-end gap-3 mb-4">
-    <div><p class="eyebrow mb-1">SELECCIÓN TSM</p><h2 class="section-title mb-1">Piezas para rotar.</h2><p class="text-secondary mb-0">Productos disponibles, listos para descubrir.</p></div>
-    <form class="search-form d-flex gap-2" method="get" action="{{ url_for('tienda') }}"><label class="visually-hidden" for="q">Buscar producto</label><input class="form-control" id="q" name="q" type="search" value="{{ busqueda }}" placeholder="Buscar sneakers, hoodies…"><button class="btn btn-dark" type="submit">Buscar</button></form>
-  </div>
-  {% if busqueda %}<p class="small text-secondary">Resultados para: <strong>{{ busqueda }}</strong> · <a class="text-dark" href="{{ url_for('tienda') }}#catalogo">Limpiar búsqueda</a></p>{% endif %}
-  <div class="row g-4">
-    {% for producto in productos %}
-      <div class="col-12 col-sm-6 col-xl-4">
-        <article class="product-card h-100">
-          <a href="{{ url_for('detalle_producto', id=producto._id) }}" class="product-media d-block" aria-label="Ver {{ producto.nombre }}">
-            {% if producto.get('imagen') %}<img src="{{ producto.imagen }}" alt="{{ producto.nombre }}" loading="lazy">{% else %}<img src="{{ url_for('static', filename='img/producto-placeholder.svg') }}" alt="Imagen ilustrativa de streetwear" loading="lazy">{% endif %}
-            <span class="product-category">{{ producto.categoria }}</span>
-          </a>
-          <div class="product-info p-3 p-lg-4">
-            <div class="d-flex align-items-start justify-content-between gap-2"><h3 class="h5 product-name mb-1"><a class="text-decoration-none text-dark" href="{{ url_for('detalle_producto', id=producto._id) }}">{{ producto.nombre }}</a></h3><span class="availability-dot" title="Disponible"></span></div>
-            <p class="text-secondary small mb-3">{{ producto.get('descripcion', 'Prenda o accesorio streetwear.') }}</p>
-            <div class="d-flex justify-content-between align-items-center gap-2"><span class="product-price">{% if producto.precio > 0 %}{{ producto.precio|moneda }}{% else %}Precio pendiente{% endif %}</span><a class="btn btn-outline-dark btn-sm" href="{{ url_for('detalle_producto', id=producto._id) }}">Ver producto ↗</a></div>
-          </div>
-        </article>
-      </div>
-    {% else %}
-      <div class="col-12"><div class="empty-shop text-center py-5 px-3"><div class="empty-mark">TSM.</div><h3 class="h4 fw-bold mt-3">El catálogo está preparando el siguiente drop.</h3><p class="text-secondary mx-auto" style="max-width: 460px;">Aún no hay productos disponibles. Agrega productos desde el panel de administración para que aparezcan aquí.</p><a class="btn btn-dark mt-2" href="{{ url_for('inicio') }}">Abrir administración</a></div></div>
-    {% endfor %}
-  </div>
+<section class="store-hero"><div class="container hero-content"><div class="row align-items-center g-4"><div class="col-lg-7"><span class="hero-kicker">STREETWEAR / EVERYDAY UNIFORM</span><h1 class="display-3 fw-bold hero-title">Tu estilo.<br><span>Sin reglas.</span></h1><p class="hero-copy">Sneakers, prendas esenciales y accesorios para construir tu propio look.</p><div class="d-flex flex-wrap gap-2 mt-4"><a class="btn btn-light btn-lg px-4" href="#catalogo">Explorar catálogo</a><a class="btn btn-outline-light btn-lg px-4" href="{{ url_for('ver_carrito') }}">Ver carrito · {{ carrito_cantidad }}</a></div></div><div class="col-lg-5 d-none d-lg-block"><div class="hero-art"><div class="hero-art-ring"></div><div class="hero-art-label">DROP<br>YOUR<br>OWN<br>RULES<span>.</span></div><div class="hero-art-tag">TSM / 001</div></div></div></div></div></section>
+<section class="container py-5" id="catalogo"><div class="d-flex flex-column flex-md-row justify-content-between align-items-md-end gap-3 mb-4"><div><p class="eyebrow mb-1">SELECCIÓN TSM</p><h2 class="section-title mb-1">Piezas para rotar.</h2><p class="text-secondary mb-0">Los agotados siguen visibles; la tienda impide comprarlos.</p></div><span class="small text-secondary">{{ productos|length }} resultado(s)</span></div>
+<form id="filtros-catalogo" class="catalog-filters row g-2 mb-4" method="get" action="{{ url_for('tienda') }}">
+  <div class="col-12 col-md-4"><label class="visually-hidden" for="q">Buscar producto</label><input class="form-control" id="q" name="q" type="search" value="{{ filtros.q }}" placeholder="Buscar sneakers, hoodies…"></div>
+  <div class="col-6 col-md-2"><label class="visually-hidden" for="categoria">Categoría</label><select class="form-select" id="categoria" name="categoria"><option value="">Todas las categorías</option>{% for cat in categorias %}<option value="{{ cat }}" {% if filtros.categoria==cat %}selected{% endif %}>{{ cat }}</option>{% endfor %}</select></div>
+  <div class="col-6 col-md-2"><label class="visually-hidden" for="estado">Disponibilidad</label><select class="form-select" id="estado" name="estado"><option value="">Todos los estados</option><option value="Disponible" {% if filtros.estado=='Disponible' %}selected{% endif %}>Disponible</option><option value="Agotado" {% if filtros.estado=='Agotado' %}selected{% endif %}>Agotado</option></select></div>
+  <div class="col-6 col-md-1"><label class="visually-hidden" for="min_precio">Precio mínimo</label><input class="form-control" id="min_precio" name="min_precio" type="number" min="0" step="1" value="{{ filtros.min_precio }}" placeholder="$ mín."></div>
+  <div class="col-6 col-md-1"><label class="visually-hidden" for="max_precio">Precio máximo</label><input class="form-control" id="max_precio" name="max_precio" type="number" min="0" step="1" value="{{ filtros.max_precio }}" placeholder="$ máx."></div>
+  <div class="col-8 col-md-2"><label class="visually-hidden" for="orden">Ordenar</label><select class="form-select" id="orden" name="orden"><option value="nombre" {% if filtros.orden=='nombre' %}selected{% endif %}>Nombre A-Z</option><option value="precio_asc" {% if filtros.orden=='precio_asc' %}selected{% endif %}>Precio: menor</option><option value="precio_desc" {% if filtros.orden=='precio_desc' %}selected{% endif %}>Precio: mayor</option><option value="recientes" {% if filtros.orden=='recientes' %}selected{% endif %}>Más recientes</option></select></div>
+  <div class="col-4 d-md-none"><button class="btn btn-dark w-100" type="submit">Filtrar</button></div><div class="col-12"><a class="small text-dark" href="{{ url_for('tienda') }}#catalogo">Limpiar filtros</a><span id="search-status" class="small text-secondary ms-2" aria-live="polite"></span></div>
+</form>
+<div id="catalogo-resultados">{% include '_product_grid.html' %}</div>
 </section>
 <section class="container pb-5"><div class="shipping-strip"><div><span class="eyebrow">COMPRA DE DEMOSTRACIÓN</span><h2 class="h4 fw-bold mb-1">Explora. Elige. Combina.</h2><p class="mb-0 text-secondary">El checkout es simulado: esta práctica no realiza cobros reales.</p></div><a href="{{ url_for('ayuda') }}" class="btn btn-outline-dark">Cómo funciona</a></div></section>
 {% endblock %}
+{% block scripts %}<script>
+(function(){const form=document.getElementById('filtros-catalogo');if(!form)return;const target=document.getElementById('catalogo-resultados');const status=document.getElementById('search-status');let timer=null;let controller=null;async function buscar(){if(controller)controller.abort();controller=new AbortController();const params=new URLSearchParams(new FormData(form));status.textContent='Buscando…';try{const r=await fetch('{{ url_for("resultados_catalogo") }}?'+params.toString(),{headers:{'X-Requested-With':'fetch'},signal:controller.signal});if(!r.ok)throw new Error('Error de búsqueda');target.innerHTML=await r.text();status.textContent='Resultados actualizados';history.replaceState(null,'', '{{ url_for("tienda") }}?'+params.toString()+'#catalogo');}catch(e){if(e.name!=='AbortError')status.textContent='No se pudo actualizar; puedes usar el botón Filtrar.';}}form.addEventListener('submit',e=>{e.preventDefault();buscar()});form.querySelectorAll('input,select').forEach(el=>{el.addEventListener(el.id==='q'?'input':'change',()=>{clearTimeout(timer);timer=setTimeout(buscar,el.id==='q'?300:0)});});})();
+</script>{% endblock %}

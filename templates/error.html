@@ -1,7 +1,1 @@
-{% extends 'base.html' %}
-{% block titulo %}Aviso · Tienda Estilo Moda{% endblock %}
-{% block encabezado %}No se pudo completar la acción{% endblock %}
-{% block bajada %}Revisa el mensaje y vuelve a intentar.{% endblock %}
-{% block contenido %}
-<div class="alert alert-danger" role="alert"><p class="mb-3">{{ mensaje }}</p><a class="btn btn-outline-danger" href="{{ url_for('inicio') }}">Volver al inventario</a> <a class="btn btn-dark ms-1" href="{{ url_for('tienda') }}">Ver tienda</a></div>
-{% endblock %}
+{% extends 'base_tienda.html' %}{% block titulo %}No se pudo completar · Tienda Estilo Moda{% endblock %}{% block contenido %}<section class="container py-5"><div class="empty-shop text-center p-5"><div class="empty-mark">TSM.</div><h1 class="h3 fw-bold mt-3">No se pudo completar la solicitud</h1><p class="text-secondary mx-auto" style="max-width:650px">{{ mensaje }}</p><a class="btn btn-dark mt-2" href="{{ url_for('tienda') }}">Volver a la tienda</a></div></section>{% endblock %}
