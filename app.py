@@ -2,6 +2,7 @@ import os
 import uuid
 import re
 import secrets
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import wraps
@@ -10,10 +11,11 @@ from urllib.parse import urlparse
 
 from bson import ObjectId
 from dotenv import load_dotenv
-from flask import Flask, abort, flash, g, jsonify, redirect, render_template, request, session, url_for
-from pymongo import MongoClient
+from flask import Flask, abort, flash, g, jsonify, redirect, render_template, request, send_file, session, url_for
+from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 from werkzeug.security import check_password_hash, generate_password_hash
+import qrcode
 
 load_dotenv()
 
@@ -61,29 +63,62 @@ METODOS_PAGO = {
 CARRITO_MAX_CANTIDAD = 10
 TIEMPO_RESERVA_MINUTOS = 5
 
-# La guía original indexa carrito + producto. En una tienda de ropa también
-# se debe poder reservar más de una combinación de talla/color del mismo producto.
-# Solo se consulta list_indexes si la colección ya existe; así el primer arranque
-# no depende de que MongoDB haya creado previamente `reservas`.
+# La colección conserva el historial de reservas. Solo puede existir una reserva
+# temporal activa por visitante, producto y variante; las canceladas, vencidas y
+# confirmadas permanecen como historial y no bloquean una reserva posterior.
+clave_reserva = (
+    ("reserva_id", 1),
+    ("producto_id", 1),
+    ("talla", 1),
+    ("color", 1),
+)
+nombre_indice_reserva = "reserva_temporal_carrito_producto_variante_unique"
+indice_objetivo_presente = False
+
 if "reservas" in base_datos.list_collection_names(filter={"name": "reservas"}):
-    # Normaliza documentos simples creados por una versión previa de la práctica.
-    reservas.update_many({"talla": {"$exists": False}}, {"$set": {"talla": ""}})
-    reservas.update_many({"color": {"$exists": False}}, {"$set": {"color": ""}})
-    for indice in reservas.list_indexes():
-        claves = list(indice.get("key", {}).items())
-        if indice.get("unique") and claves == [("reserva_id", 1), ("producto_id", 1)]:
+    for indice in list(reservas.list_indexes()):
+        claves = tuple(indice.get("key", {}).items())
+        if claves != clave_reserva:
+            continue
+        filtro_parcial = indice.get("partialFilterExpression") or {}
+        es_indice_objetivo = (
+            indice.get("name") == nombre_indice_reserva
+            and indice.get("unique") is True
+            and filtro_parcial == {"estado": "temporal"}
+        )
+        if es_indice_objetivo:
+            indice_objetivo_presente = True
+        else:
+            # Retira índices únicos anteriores que impedían conservar el historial.
             reservas.drop_index(indice["name"])
 
-reservas.create_index(
-    [("reserva_id", 1), ("producto_id", 1), ("talla", 1), ("color", 1)],
-    unique=True,
-    name="reserva_carrito_producto_variante_unique",
-)
-reservas.create_index("vence_en")
+    # Compatibilidad con la versión previa de esta mejora, que usaba "activa".
+    reservas.update_many({"estado": "activa"}, {"$set": {"estado": "temporal"}})
+    reservas.update_many(
+        {"visitante_id": {"$exists": False}},
+        [{"$set": {"visitante_id": {"$ifNull": ["$reserva_id", ""]}}}],
+    )
+    reservas.update_many(
+        {"recurso_id": {"$exists": False}},
+        [{"$set": {"recurso_id": "$producto_id"}}],
+    )
+    reservas.update_many({"talla": {"$exists": False}}, {"$set": {"talla": ""}})
+    reservas.update_many({"color": {"$exists": False}}, {"$set": {"color": ""}})
 
+if not indice_objetivo_presente:
+    reservas.create_index(
+        list(clave_reserva),
+        unique=True,
+        name=nombre_indice_reserva,
+        partialFilterExpression={"estado": "temporal"},
+    )
+reservas.create_index("vence_en")
+reservas.create_index([("producto_id", 1), ("estado", 1)], name="reservas_por_producto_estado")
 
 def ahora_utc():
     return datetime.now(timezone.utc)
+
+
 def obtener_reserva_id():
     if not session.get("reserva_id"):
         session["reserva_id"] = uuid.uuid4().hex
@@ -468,7 +503,7 @@ def reservar_cantidad(producto_id, reserva_id, cantidad=1, talla="", color=""):
                             "producto_id": oid,
                             "talla": str(talla),
                             "color": str(color),
-                            "estado": "activa",
+                            "estado": "temporal",
                             "vence_en": {"$gt": ahora},
                         },
                         session=mongo_session,
@@ -494,13 +529,16 @@ def reservar_cantidad(producto_id, reserva_id, cantidad=1, talla="", color=""):
                             "producto_id": oid,
                             "talla": str(talla),
                             "color": str(color),
+                            "estado": "temporal",
                         },
                         {
                             "$inc": {"cantidad": cantidad},
                             "$set": {
+                                "visitante_id": reserva_id,
+                                "recurso_id": oid,
                                 "talla": str(talla),
                                 "color": str(color),
-                                "estado": "activa",
+                                "estado": "temporal",
                                 "vence_en": vence,
                             },
                             "$setOnInsert": {"creada_en": ahora},
@@ -527,72 +565,74 @@ def reservar_unidad(producto_id, reserva_id, talla="", color=""):
 
 
 def liberar_reservas_vencidas():
-    """Libera reservas vencidas y devuelve sus unidades mediante transacciones."""
+    """Marca vencidas y devuelve existencias mediante transacciones.
+
+    El documento se conserva en Atlas con estado ``vencida`` para el historial.
+    """
     ahora = ahora_utc()
     vencidas = list(
-        reservas.find({"estado": "activa", "vence_en": {"$lte": ahora}})
+        reservas.find({"estado": "temporal", "vence_en": {"$lte": ahora}})
     )
     for candidata in vencidas:
         with cliente.start_session() as mongo_session:
             with mongo_session.start_transaction():
-                eliminada = reservas.find_one_and_delete(
+                vencida = reservas.find_one_and_update(
                     {
                         "_id": candidata["_id"],
-                        "estado": "activa",
+                        "estado": "temporal",
                         "vence_en": {"$lte": ahora},
                     },
+                    {"$set": {"estado": "vencida", "vencida_en": ahora, "liberada_en": ahora}},
+                    return_document=ReturnDocument.BEFORE,
                     session=mongo_session,
                 )
-                if not eliminada:
+                if not vencida:
                     continue
                 producto = productos.find_one(
-                    {"_id": eliminada["producto_id"]},
+                    {"_id": vencida["producto_id"]},
                     session=mongo_session,
                 )
                 if not producto:
                     continue
-                cantidad = entero_seguro(eliminada.get("cantidad", 0))
+                cantidad = entero_seguro(vencida.get("cantidad", 0))
                 if not _restar_reservadas_producto(
                     producto,
                     cantidad,
-                    str(eliminada.get("talla", "")),
-                    str(eliminada.get("color", "")),
+                    str(vencida.get("talla", "")),
+                    str(vencida.get("color", "")),
                     mongo_session,
                 ):
                     raise RuntimeError("No se pudo liberar el inventario de una reserva vencida.")
 
 
 def eliminar_reserva(reserva_id, producto_id, talla="", color=""):
-    """Cancela una reserva exacta y libera su inventario de forma atómica."""
+    """Cancela una reserva temporal y conserva su registro histórico."""
     if not reserva_id or not ObjectId.is_valid(str(producto_id)):
         return False
     oid = ObjectId(str(producto_id))
     ahora = ahora_utc()
-    eliminada = None
     with cliente.start_session() as mongo_session:
         with mongo_session.start_transaction():
-            eliminada = reservas.find_one_and_delete(
+            cancelada = reservas.find_one_and_update(
                 {
                     "reserva_id": reserva_id,
                     "producto_id": oid,
                     "talla": str(talla),
                     "color": str(color),
-                    "estado": "activa",
+                    "estado": "temporal",
                     "vence_en": {"$gt": ahora},
                 },
+                {"$set": {"estado": "cancelada", "cancelada_en": ahora, "liberada_en": ahora}},
+                return_document=ReturnDocument.BEFORE,
                 session=mongo_session,
             )
-            if not eliminada:
+            if not cancelada:
                 return False
             producto = productos.find_one({"_id": oid}, session=mongo_session)
             if producto:
-                cantidad = entero_seguro(eliminada.get("cantidad", 0))
+                cantidad = entero_seguro(cancelada.get("cantidad", 0))
                 if not _restar_reservadas_producto(
-                    producto,
-                    cantidad,
-                    str(eliminada.get("talla", "")),
-                    str(eliminada.get("color", "")),
-                    mongo_session,
+                    producto, cantidad, str(talla), str(color), mongo_session
                 ):
                     raise RuntimeError("No se pudo devolver el inventario al cancelar la reserva.")
     return True
@@ -609,7 +649,7 @@ def actualizar_reserva_cantidad(reserva_id, producto_id, nueva_cantidad, talla="
         "producto_id": oid,
         "talla": str(talla),
         "color": str(color),
-        "estado": "activa",
+        "estado": "temporal",
         "vence_en": {"$gt": ahora_utc()},
     })
     if not existente:
@@ -632,7 +672,7 @@ def actualizar_reserva_cantidad(reserva_id, producto_id, nueva_cantidad, talla="
                 "producto_id": oid,
                 "talla": talla,
                 "color": color,
-                "estado": "activa",
+                "estado": "temporal",
                 "vence_en": {"$gt": ahora},
                 "cantidad": {"$gte": liberar},
             }, session=mongo_session)
@@ -824,7 +864,7 @@ def cantidad_carrito():
     ahora = ahora_utc()
     items = reservas.find({
         "reserva_id": reserva_id,
-        "estado": "activa",
+        "estado": "temporal",
         "vence_en": {"$gt": ahora},
     })
     return sum(entero_seguro(item.get("cantidad", 0)) for item in items)
@@ -840,7 +880,7 @@ def obtener_articulos_carrito():
     ahora = ahora_utc()
     items = list(reservas.find({
         "reserva_id": reserva_id,
-        "estado": "activa",
+        "estado": "temporal",
         "vence_en": {"$gt": ahora},
     }).sort("vence_en", 1))
 
@@ -1039,7 +1079,7 @@ def salir():
     if reserva_id:
         abiertas = list(reservas.find({
             "reserva_id": reserva_id,
-            "estado": "activa",
+            "estado": "temporal",
             "vence_en": {"$gt": ahora_utc()},
         }))
         for item in abiertas:
@@ -1102,6 +1142,52 @@ def resultados_catalogo():
     return render_template("_product_grid.html", productos=lista, busqueda=q, next_url=url_for("tienda") + (("?" + request.query_string.decode("utf-8")) if request.query_string else "") + "#catalogo")
 
 
+@app.route("/salud")
+@app.route("/api/salud")
+def salud():
+    """Verificación sencilla del servicio y su conexión con MongoDB Atlas."""
+    cliente.admin.command("ping")
+    return jsonify({"ok": True, "mensaje": "Tienda Estilo Moda y MongoDB Atlas funcionan."})
+
+
+def url_publica_ficha_producto(producto_id):
+    """Construye una URL pública estable para el QR (Render mediante APP_BASE_URL)."""
+    ruta = url_for("ficha_publica", id=str(producto_id))
+    base = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
+    if base:
+        return f"{base}{ruta}"
+    return url_for("ficha_publica", id=str(producto_id), _external=True)
+
+
+@app.route("/qr/producto/<id>.png")
+def qr_producto(id):
+    producto = buscar_producto(id)
+    url_ficha = url_publica_ficha_producto(producto["_id"])
+    imagen = qrcode.make(url_ficha, box_size=8, border=4)
+    salida = BytesIO()
+    imagen.save(salida, format="PNG")
+    salida.seek(0)
+    respuesta = send_file(
+        salida,
+        mimetype="image/png",
+        download_name=f"TSM-QR-{producto['_id']}.png",
+        max_age=300,
+    )
+    respuesta.headers["X-Content-Type-Options"] = "nosniff"
+    return respuesta
+
+
+@app.route("/ficha/<id>")
+def ficha_publica(id):
+    liberar_reservas_vencidas()
+    producto = buscar_producto(id)
+    return render_template(
+        "ficha_publica.html",
+        producto=producto,
+        url_ficha=url_publica_ficha_producto(producto["_id"]),
+    )
+
+
 @app.route("/producto/<id>")
 def detalle_producto(id):
     liberar_reservas_vencidas()
@@ -1159,7 +1245,7 @@ def ver_carrito():
     reserva_id = session.get("reserva_id")
     items = list(reservas.find({
         "reserva_id": reserva_id,
-        "estado": "activa",
+        "estado": "temporal",
         "vence_en": {"$gt": ahora_utc()},
     })) if reserva_id else []
     fechas = [fecha_utc(item.get("vence_en")) for item in items]
@@ -1347,7 +1433,7 @@ def confirmar_checkout():
             with mongo_session.start_transaction():
                 items_reservados = list(reservas.find({
                     "reserva_id": reserva_id,
-                    "estado": "activa",
+                    "estado": "temporal",
                     "vence_en": {"$gt": ahora},
                 }, session=mongo_session))
                 if not items_reservados:
@@ -1468,12 +1554,20 @@ def confirmar_checkout():
                     "creado_en": ahora,
                 }
                 resultado_pedido = pedidos.insert_one(pedido, session=mongo_session)
-                eliminadas = reservas.delete_many({
-                    "reserva_id": reserva_id,
-                    "estado": "activa",
-                    "vence_en": {"$gt": ahora_utc()},
-                }, session=mongo_session)
-                if eliminadas.deleted_count != len(items_reservados):
+                reservas_confirmadas = reservas.update_many(
+                    {
+                        "reserva_id": reserva_id,
+                        "estado": "temporal",
+                        "vence_en": {"$gt": ahora},
+                    },
+                    {"$set": {
+                        "estado": "confirmada",
+                        "confirmada_en": ahora,
+                        "pedido_id": resultado_pedido.inserted_id,
+                    }},
+                    session=mongo_session,
+                )
+                if reservas_confirmadas.matched_count != len(items_reservados):
                     raise ValueError("Las reservas cambiaron durante la confirmación. Inténtalo nuevamente.")
                 if cupon_usado:
                     cupones.update_one(
@@ -1686,7 +1780,7 @@ def editar(id):
 def eliminar(id):
     liberar_reservas_vencidas()
     producto = buscar_producto(id)
-    if reservas.count_documents({"producto_id": producto["_id"], "estado": "activa"}):
+    if reservas.count_documents({"producto_id": producto["_id"], "estado": "temporal"}):
         flash("No puedes eliminar este producto mientras tenga reservas activas.", "warning")
         return redirect(url_for("inicio") + "#lista")
     productos.delete_one({"_id": producto["_id"]})
@@ -1828,7 +1922,7 @@ def api_producto(id):
             return jsonify({"error": "Inicia sesión como administrador para eliminar productos."}), 401
         if not es_administrador():
             return jsonify({"error": "No tienes permisos para modificar el inventario."}), 403
-        if reservas.count_documents({"producto_id": producto["_id"], "estado": "activa"}):
+        if reservas.count_documents({"producto_id": producto["_id"], "estado": "temporal"}):
             return jsonify({"error": "No se puede eliminar un producto con reservas activas."}), 409
         productos.delete_one({"_id": producto["_id"]})
         return "", 204

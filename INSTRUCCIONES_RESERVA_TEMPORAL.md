@@ -1,144 +1,149 @@
-# Reserva temporal de inventario — Tienda Estilo Moda
+# Reserva temporal y QR — Tienda Estilo Moda
 
-Esta adaptación implementa en el proyecto existente los requisitos de la actividad de reserva temporal. No crea una tienda nueva ni sustituye la interfaz de Tienda Estilo Moda.
+Esta guía adapta el proyecto final del CBTIS 272 a una tienda de sneakers y streetwear. No crea una aplicación nueva ni sustituye la tienda original.
 
-## Qué quedó integrado
+## Modelo de reserva elegido
 
-- Cada producto puede reservarse durante **5 minutos**.
-- El carrito real se consulta desde MongoDB, colección `reservas`; dejó de depender de `session['carrito']`.
-- Los productos simples usan `stock` y `reservadas`.
-- Los productos con tallas y colores usan `variantes[].stock` y `variantes[].reservadas`.
-- La disponibilidad visible se calcula como existencias físicas menos unidades reservadas.
-- La reserva, cancelación, vencimiento, ajuste de cantidad y confirmación de pedido actualizan inventario y reserva mediante transacciones.
-- Al cancelar o vencer, las unidades vuelven a estar disponibles.
-- Al confirmar, se descuentan tanto `stock` como `reservadas`, se crea el pedido y se eliminan los documentos de reserva.
-- El inicio de sesión y el registro conservan el identificador del carrito invitado, para que no se pierdan las reservas al entrar al checkout.
-- El panel administrativo no permite eliminar productos ni quitar variantes que tengan reservas activas, ni reducir las existencias por debajo de las unidades apartadas.
+El recurso es **una cantidad de un producto**, identificada además por talla y color cuando el producto tiene variantes. La reserva dura **5 minutos**.
 
-## Adaptación de nombres respecto al PDF
+- `stock`: existencias físicas totales.
+- `reservadas`: unidades apartadas temporalmente.
+- `stock_disponible`: cálculo de presentación (`stock - reservadas`).
+- Para variantes, el inventario y las reservas se guardan por cada combinación de talla/color.
 
-La guía de Dreamy Coffee usa la colección `alumnos` y los campos `existencias`. Este proyecto de moda usa la colección `productos` y el campo `stock`, por eso se conservaron los nombres reales del proyecto. También se conserva el alias `alumnos = productos` por compatibilidad con las prácticas anteriores.
+La colección `reservas` conserva el historial. Sus estados son:
 
-Ejemplo de producto sin variantes:
+- `temporal`: unidad apartada y todavía vigente.
+- `confirmada`: forma parte de un pedido.
+- `cancelada`: el visitante liberó la unidad.
+- `vencida`: terminó el plazo y se liberó la unidad.
 
-```json
-{
-  "nombre": "Sudadera negra",
-  "stock": 3,
-  "reservadas": 1,
-  "estado": "Disponible"
-}
-```
+## Seguridad y requisitos de MongoDB
 
-Ejemplo de producto por talla y color:
+Las reservas y la confirmación de pedidos usan transacciones multi-documento. Utiliza MongoDB Atlas (replica set administrado) o un MongoDB local configurado como replica set. Un servicio MongoDB local standalone no admite estas transacciones.
 
-```json
-{
-  "nombre": "Tenis urbanos",
-  "variantes": [
-    { "talla": "26", "color": "Blanco", "stock": 3, "reservadas": 1 },
-    { "talla": "27", "color": "Blanco", "stock": 2, "reservadas": 0 }
-  ]
-}
-```
+Nunca pegues `MONGO_URI`, `SECRET_KEY`, contraseñas o claves de administración en `app.py`, GitHub, capturas ni el informe.
 
-La colección `reservas` almacena un documento por carrito, producto y variante, con campos como `reserva_id`, `producto_id`, `cantidad`, `talla`, `color`, `estado`, `creada_en` y `vence_en`. El índice único utiliza `reserva_id + producto_id + talla + color`, por lo que un mismo carrito puede reservar varias combinaciones de talla/color del mismo producto. En productos sin variantes, talla y color se guardan como cadenas vacías.
-
-## Requisito de MongoDB para transacciones
-
-**Importante:** `start_transaction()` necesita MongoDB Atlas o un servidor MongoDB configurado como replica set. Una instalación local estándar que funcione como servidor independiente (*standalone*) no admite estas transacciones.
-
-- Si el proyecto ya usa MongoDB Atlas, conserva tu `MONGO_URI` actual en `.env`; Atlas admite transacciones en los clústeres compatibles.
-- Si usas MongoDB local, debes configurarlo como replica set. En `mongod.cfg`, agrega al nivel principal (sin meterlo dentro de `storage`):
-
-```yaml
-replication:
-  replSetName: rs0
-```
-
-Reinicia el servicio de MongoDB y abre `mongosh`:
-
-```javascript
-rs.initiate()
-rs.status()
-```
-
-Después, el URI local de `.env` debe incluir el replica set:
-
-```env
-MONGO_URI=mongodb://127.0.0.1:27017/?replicaSet=rs0
-```
-
-No configures esto a ciegas sobre un `mongod.cfg` distinto: conserva sus valores actuales de `storage.dbPath`, `systemLog` y `net.port`.
-
-## Instalación en tu proyecto
+## Instalación y actualización local
 
 1. Detén Flask con `Ctrl + C`.
-2. Haz una copia completa de tu carpeta `belleza-ana` antes de reemplazar archivos.
-3. Copia los archivos de este paquete sobre tu carpeta del proyecto y acepta reemplazar los archivos que tengan el mismo nombre.
-4. **No borres ni reemplaces** tu archivo `.env`, la carpeta `.git` ni tu entorno `.venv`.
-5. Comprueba que `.env` tenga `MONGO_URI` y `SECRET_KEY`. No pegues esas claves en el código ni las subas a GitHub.
-6. Antes de cambiar el inventario, abre MongoDB Atlas/Compass y toma una captura de un producto de prueba donde se vean sus campos actuales. Esa evidencia previa también la pide la guía.
-7. Ejecuta una sola vez la migración:
+2. Haz copia de seguridad de toda la carpeta `belleza-ana`.
+3. Copia los archivos de este paquete sobre tu carpeta existente y acepta reemplazar los archivos del proyecto.
+4. No reemplaces ni borres `.git`, `.env` ni `.venv`.
+5. Comprueba que `.env` contiene la URI correcta de MongoDB Atlas y una `SECRET_KEY` privada. `APP_BASE_URL` puede quedar vacío en local.
+6. Instala dependencias:
 
-```powershell
-.\.venv\Scripts\python.exe migrar_inventario_reservas.py
+   ```powershell
+   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+   ```
+
+7. Comprueba la conexión:
+
+   ```powershell
+   .\.venv\Scripts\python.exe validar_mongo.py
+   ```
+
+8. Ejecuta la migración **una sola vez antes de probar reservas**:
+
+   ```powershell
+   .\.venv\Scripts\python.exe migrar_inventario_reservas.py
+   ```
+
+9. Abre Atlas → `tienda_estilo_moda` → `productos`. Revisa `stock` y `reservadas`. En productos antiguos sin stock, el script inicializa 10 unidades provisionales cuando el estado es Disponible. Corrige ese valor desde Administración al inventario real antes de publicar. Para variantes, revisa `variantes[].stock` y `variantes[].reservadas`.
+10. Inicia la tienda:
+
+   ```powershell
+   .\.venv\Scripts\python.exe app.py
+   ```
+
+11. Abre `http://127.0.0.1:5000/`.
+
+La colección `reservas` y sus índices se crean al iniciar la aplicación. Las reservas activas antiguas con estado `activa` se migran a `temporal`; las canceladas, vencidas y confirmadas se conservan para historial.
+
+## Flujo del cliente
+
+1. El cliente elige un producto y, si corresponde, talla y color.
+2. Flask consulta y actualiza el inventario en Atlas dentro de una transacción.
+3. Si hay unidades, crea una reserva y registra `creada_en` y `vence_en`.
+4. El carrito muestra un contador calculado con `vence_en`.
+5. El cliente puede actualizar la cantidad, cancelar o confirmar.
+6. Cancelar cambia el estado a `cancelada` y devuelve las unidades reservadas.
+7. Al vencer, la aplicación cambia el estado a `vencida` y devuelve las unidades al primer acceso que comprueba el inventario después del vencimiento.
+8. Confirmar cambia el estado a `confirmada`, crea el pedido, descuenta `stock` y `reservadas` y limpia la sesión de reserva.
+
+MongoDB y Flask son la autoridad del tiempo y la disponibilidad; el contador del navegador solo informa. Las consultas de catálogo, carrito y ficha liberan las reservas vencidas antes de mostrar la disponibilidad.
+
+## Código QR
+
+En el detalle de cada producto aparece un QR y un botón para abrir o descargar su ficha. El QR apunta a `/ficha/<id>`, que consulta Atlas cada vez que se abre y muestra datos públicos actualizados: nombre, categoría, descripción, precio y disponibilidad. No expone cuentas, correos, claves, contraseñas ni `MONGO_URI`.
+
+En Render configura `APP_BASE_URL` con la URL HTTPS del servicio, por ejemplo:
+
+```text
+APP_BASE_URL=https://tienda-estilo-moda.onrender.com
 ```
 
-8. Revisa los productos en MongoDB Atlas/Compass, colección `tienda_estilo_moda.productos`. Corrige las existencias de prueba y coloca el stock real. El número `10` solo se usa para productos antiguos sin campo `stock` y debe sustituirse por las existencias reales.
-9. Instala dependencias y ejecuta la tienda:
-
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe app.py
-```
-
-10. Abre `http://127.0.0.1:5000/`.
-
-Al iniciar la aplicación se crean los índices de `reservas`: uno único para `reserva_id + producto_id + talla + color` y otro para `vence_en`. Si existe el índice único anterior de `reserva_id + producto_id`, se sustituye por el índice compatible con variantes. Los documentos antiguos de productos simples reciben talla y color vacíos para conservar su identidad.
+Después de publicar, abre el detalle de producto, escanea el QR con un celular y confirma que abre la ficha de Render. Cambia temporalmente el stock/estado desde Administración y escanea el mismo QR otra vez: la ficha debe mostrar la información actualizada.
 
 ## Pruebas obligatorias
 
-Hazlas primero con un producto de prueba, no con toda la tienda.
+Utiliza un producto de prueba con al menos una unidad disponible. Para demostrar el bloqueo, utiliza una ventana normal (usuario A) y otra de incógnito (usuario B).
 
-1. **Reserva normal:** deja un producto con 3 existencias y 0 reservadas. Agrégalo una vez. El carrito debe mostrar cantidad 1 y MongoDB debe mostrar `reservadas: 1` (o el contador equivalente en la variante).
-2. **Última unidad:** deja un producto con 1 existencia. En una ventana normal, resérvalo. En una ventana incógnita, abre el mismo producto. Debe aparecer `Sin disponibilidad temporal` y no debe permitir reservarlo.
-3. **Cancelación:** elimina el artículo del carrito. El documento de reserva debe borrarse y el contador de reservadas debe volver a 0.
-4. **Vencimiento:** vuelve a reservar y espera 5 minutos. Al recargar el catálogo o carrito, la reserva vencida se libera y la unidad vuelve a estar disponible.
-5. **Compra:** inicia sesión o crea una cuenta, reserva un producto y confirma el pedido. Debe aparecer un documento en `pedidos`, disminuir `stock`, disminuir `reservadas` y desaparecer el documento de `reservas`. El pago sigue siendo una simulación.
-6. **Varias tallas/colores:** reserva dos combinaciones distintas del mismo producto en el mismo carrito. Deben aparecer como dos líneas, y actualizar/eliminar una no debe modificar la otra.
-7. **Doble clic / concurrencia:** prueba dos ventanas con la última unidad. Nunca deben quedar existencias disponibles ni contadores reservados negativos.
+1. A reserva una unidad disponible: el carrito muestra el contador y Atlas registra `estado: temporal`, `cantidad`, `creada_en` y `vence_en`.
+2. B abre el mismo producto y actualiza la página: ve disponibilidad temporal agotada y no puede reservar esa última unidad.
+3. A cancela: Atlas conserva una reserva `cancelada` y las unidades reservadas regresan a cero; B ya puede reservar.
+4. A reserva y espera 5 minutos: al recargar catálogo o carrito, Atlas registra `vencida` y libera las unidades.
+5. A reserva de nuevo y confirma: se crea un pedido, el stock físico disminuye, el campo reservado disminuye y la reserva queda `confirmada` con el `pedido_id`.
+6. Recarga o vuelve a abrir la página: la disponibilidad sigue coincidiendo con Atlas.
+7. Escanea el QR desde un celular: abre `/ficha/<id>` en Render.
+8. Cambia la disponibilidad desde Administración y escanea el mismo QR: muestra el nuevo estado.
+9. Abre `/ficha/ID-QUE-NO-EXISTE`: debe mostrar un error 404 entendible y no detener el servicio.
+10. Abre el sitio desde otro equipo o celular: no debe depender de `localhost` ni de archivos locales.
 
-## Evidencias para entregar
+No afirmes que una prueba pasó hasta observar el resultado real en tu sitio y en Atlas. Conserva capturas antes y después.
 
-- Captura de un producto en Atlas con existencias y reservadas.
-- Captura de un documento activo en la colección `reservas`.
-- Captura del contador de 5 minutos en el carrito.
-- Captura de la ventana A que reservó y ventana B que ya no puede reservar la última unidad.
-- Captura después de cancelar o vencer, mostrando que la unidad se liberó.
-- Captura de la compra confirmada y del inventario actualizado.
-- Enlace del commit o rama en GitHub.
-- URL funcional de Render.
+## GitHub
 
-## GitHub y Render
-
-En la carpeta `belleza-ana`, revisa primero la rama y los cambios:
+Trabaja en la rama que contiene la mejora (por ejemplo `proyecto-final` o `reserva-temporal`, según la que ya creaste). Antes de subir:
 
 ```powershell
 git status
 git branch --show-current
+git check-ignore -v .env
+git add app.py requirements.txt .env.example README.md GUIA_PROYECTO_FINAL.md INSTRUCCIONES_RESERVA_TEMPORAL.md migrar_inventario_reservas.py validar_mongo.py templates static
+git status
+git commit -m "Integra reservas temporales y QR en la tienda"
+git push origin NOMBRE-DE-TU-RAMA
 ```
 
-Si sigues en la rama `reserva-temporal`, después de probar localmente:
+Sustituye `NOMBRE-DE-TU-RAMA` por el nombre que devuelva `git branch --show-current`. Antes de `commit`, comprueba que `.env` no aparece entre los archivos preparados. El PDF solicita al menos cuatro commits en el historial; conserva los commits previos del primer parcial y documenta los avances reales sin crear commits vacíos.
 
-```powershell
-git add app.py migrar_inventario_reservas.py INSTRUCCIONES_RESERVA_TEMPORAL.md templates static
-git commit -m "Completar reservas temporales de inventario"
-git push -u origin reserva-temporal
-```
+## Render
 
-Verifica que Render despliegue la rama correcta o integra la rama a `main` según las indicaciones de tu docente. En Render deben seguir configuradas las variables secretas `MONGO_URI` y `SECRET_KEY`. Después prueba la URL pública en una ventana normal y otra incógnita.
+Actualiza el servicio existente de Tienda Estilo Moda, no crees otra tienda:
 
-## Nota de seguridad
+- Repositorio: `cristianadm-wq/tienda_estilo_moda`.
+- Build: `pip install -r requirements.txt`.
+- Start: `gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 60`.
+- Variables: `MONGO_URI`, `SECRET_KEY`, `APP_BASE_URL`.
+- `APP_BASE_URL` debe ser la URL HTTPS del servicio de Render.
 
-El checkout continúa siendo de demostración. No solicita datos bancarios ni realiza cobros reales.
+Asegúrate de que Render despliegue la rama donde subiste los cambios. En MongoDB Atlas → Network Access, conserva las IP que necesites y permite las direcciones de salida indicadas por Render. No publiques la URI ni abras el acceso global de forma permanente.
+
+Al terminar, prueba `/api/salud`, la tienda, reserva, cancelación, vencimiento, compra y QR desde la URL pública.
+
+## Evidencias que debes reunir
+
+- Producto y sus existencias antes de la migración.
+- Documento del producto en Atlas con `stock` y `reservadas`.
+- Colección `reservas` mostrando un documento temporal con `vence_en`.
+- Carrito con contador de 5 minutos.
+- Usuario A reservando y usuario B bloqueado.
+- Reserva cancelada y disponibilidad liberada.
+- Reserva vencida y disponibilidad liberada.
+- Pedido confirmado y reserva con estado `confirmada`.
+- QR en el detalle del producto y escaneo desde celular.
+- Ficha pública mostrando un estado actualizado.
+- GitHub con README, historial de commits y Render Live.
+
+Captura Atlas sin mostrar usuarios/contraseñas ni la cadena `MONGO_URI`.

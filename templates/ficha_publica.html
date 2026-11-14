@@ -1,0 +1,32 @@
+{% extends 'base_tienda.html' %}
+{% block titulo %}Ficha pública · {{ producto.nombre }} · Tienda Estilo Moda{% endblock %}
+{% block contenido %}
+<section class="container py-5">
+  <p class="eyebrow">FICHA PÚBLICA · TSM</p>
+  <div class="row g-4 align-items-center">
+    <div class="col-md-5">
+      <div class="detail-image">
+        {% if producto.imagen %}<img src="{{ producto.imagen }}" alt="{{ producto.nombre }}">
+        {% else %}<img src="{{ url_for('static', filename='img/producto-placeholder.svg') }}" alt="Imagen ilustrativa de streetwear">{% endif %}
+      </div>
+    </div>
+    <div class="col-md-7">
+      <p class="text-secondary mb-2">{{ producto.categoria }} · TIENDA ESTILO MODA</p>
+      <h1 class="display-6 fw-bold">{{ producto.nombre }}</h1>
+      <p class="text-secondary">{{ producto.descripcion }}</p>
+      <p class="h4 fw-bold">{{ producto.precio|moneda if producto.precio > 0 else 'Precio pendiente' }}</p>
+      <div class="my-3">
+        {% if producto.drop_pendiente %}<span class="badge text-bg-warning">Próximo lanzamiento</span>
+        {% elif producto.stock <= 0 %}<span class="badge text-bg-secondary">Agotado</span>
+        {% elif producto.stock_disponible <= 0 %}<span class="badge text-bg-warning">Reservado temporalmente</span>
+        {% else %}<span class="badge text-bg-success">Disponible</span>{% endif %}
+      </div>
+      <p class="mb-1"><strong>Existencias físicas:</strong> {{ producto.stock }}</p>
+      <p class="mb-1"><strong>Unidades reservadas:</strong> {{ producto.reservadas }}</p>
+      <p class="mb-3"><strong>Disponibles para reservar:</strong> {{ producto.stock_disponible }}</p>
+      <p class="small text-secondary">Esta ficha muestra información pública y actualizada. No contiene datos privados de clientes.</p>
+      <a class="btn btn-dark" href="{{ url_for('detalle_producto', id=producto._id) }}">Ver en la tienda</a>
+    </div>
+  </div>
+</section>
+{% endblock %}
