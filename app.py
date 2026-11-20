@@ -61,7 +61,7 @@ METODOS_PAGO = {
     "contra_entrega_demo": "Pago contra entrega (demostración)",
 }
 CARRITO_MAX_CANTIDAD = 10
-TIEMPO_RESERVA_MINUTOS = 5
+TIEMPO_RESERVA_MINUTOS = 1
 
 # La colección conserva el historial de reservas. Solo puede existir una reserva
 # temporal activa por visitante, producto y variante; las canceladas, vencidas y
