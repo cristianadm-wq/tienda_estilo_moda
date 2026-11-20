@@ -1,18 +1,21 @@
 import os
+import uuid
 import re
 import secrets
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from functools import wraps
 from hmac import compare_digest
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import urlparse
 
 from bson import ObjectId
 from dotenv import load_dotenv
-from flask import Flask, abort, flash, g, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, abort, flash, g, jsonify, redirect, render_template, request, send_file, session, url_for
 from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 from werkzeug.security import check_password_hash, generate_password_hash
+import qrcode
 
 load_dotenv()
 
@@ -36,14 +39,18 @@ if not mongo_uri:
     if os.environ.get("RENDER"):
         raise RuntimeError("Configura MONGO_URI en Render.")
     mongo_uri = "mongodb://127.0.0.1:27017/"
-
-cliente = MongoClient(mongo_uri, serverSelectionTimeoutMS=10000)
+cliente = MongoClient(
+    mongo_uri,
+    serverSelectionTimeoutMS=10000,
+    tz_aware=True
+)
 base_datos = cliente["tienda_estilo_moda"]
 productos = base_datos["productos"]
 pedidos = base_datos["pedidos"]
 usuarios = base_datos["usuarios"]
 cupones = base_datos["cupones"]
 resenas = base_datos["resenas"]
+reservas = base_datos["reservas"]
 alumnos = productos  # Alias para conservar compatibilidad con la práctica CRUD.
 
 ESTADOS_VALIDOS = ("Disponible", "Agotado")
@@ -54,10 +61,68 @@ METODOS_PAGO = {
     "contra_entrega_demo": "Pago contra entrega (demostración)",
 }
 CARRITO_MAX_CANTIDAD = 10
+TIEMPO_RESERVA_MINUTOS = 1
 
+# La colección conserva el historial de reservas. Solo puede existir una reserva
+# temporal activa por visitante, producto y variante; las canceladas, vencidas y
+# confirmadas permanecen como historial y no bloquean una reserva posterior.
+clave_reserva = (
+    ("reserva_id", 1),
+    ("producto_id", 1),
+    ("talla", 1),
+    ("color", 1),
+)
+nombre_indice_reserva = "reserva_temporal_carrito_producto_variante_unique"
+indice_objetivo_presente = False
+
+if "reservas" in base_datos.list_collection_names(filter={"name": "reservas"}):
+    for indice in list(reservas.list_indexes()):
+        claves = tuple(indice.get("key", {}).items())
+        if claves != clave_reserva:
+            continue
+        filtro_parcial = indice.get("partialFilterExpression") or {}
+        es_indice_objetivo = (
+            indice.get("name") == nombre_indice_reserva
+            and indice.get("unique") is True
+            and filtro_parcial == {"estado": "temporal"}
+        )
+        if es_indice_objetivo:
+            indice_objetivo_presente = True
+        else:
+            # Retira índices únicos anteriores que impedían conservar el historial.
+            reservas.drop_index(indice["name"])
+
+    # Compatibilidad con la versión previa de esta mejora, que usaba "activa".
+    reservas.update_many({"estado": "activa"}, {"$set": {"estado": "temporal"}})
+    reservas.update_many(
+        {"visitante_id": {"$exists": False}},
+        [{"$set": {"visitante_id": {"$ifNull": ["$reserva_id", ""]}}}],
+    )
+    reservas.update_many(
+        {"recurso_id": {"$exists": False}},
+        [{"$set": {"recurso_id": "$producto_id"}}],
+    )
+    reservas.update_many({"talla": {"$exists": False}}, {"$set": {"talla": ""}})
+    reservas.update_many({"color": {"$exists": False}}, {"$set": {"color": ""}})
+
+if not indice_objetivo_presente:
+    reservas.create_index(
+        list(clave_reserva),
+        unique=True,
+        name=nombre_indice_reserva,
+        partialFilterExpression={"estado": "temporal"},
+    )
+reservas.create_index("vence_en")
+reservas.create_index([("producto_id", 1), ("estado", 1)], name="reservas_por_producto_estado")
 
 def ahora_utc():
     return datetime.now(timezone.utc)
+
+
+def obtener_reserva_id():
+    if not session.get("reserva_id"):
+        session["reserva_id"] = uuid.uuid4().hex
+    return session["reserva_id"]
 
 
 def fecha_utc(valor):
@@ -158,18 +223,43 @@ def redireccion_interna_o_tienda(destino):
         return redirect(destino)
     return redirect(url_for("inicio") if es_administrador() else url_for("tienda"))
 
-
 def stock_de_producto(producto):
+    """Existencias físicas totales, sin descontar reservas temporales."""
     variantes = producto.get("variantes") or []
     if isinstance(variantes, list) and variantes:
-        return sum(entero_seguro(v.get("stock", 0)) for v in variantes if isinstance(v, dict))
+        return sum(
+            entero_seguro(v.get("stock", 0))
+            for v in variantes
+            if isinstance(v, dict)
+        )
     if "stock" in producto:
         return entero_seguro(producto.get("stock", 0))
-    # Compatibilidad para los productos anteriores, que no tenían inventario numérico.
+    # Compatibilidad con productos antiguos que aún no tenían campo stock.
     return 10 if producto.get("estado") == "Disponible" else 0
 
 
+def stock_disponible_de_producto(producto):
+    """Unidades que puede reservar otro visitante ahora mismo."""
+    variantes = producto.get("variantes") or []
+    if isinstance(variantes, list) and variantes:
+        return sum(
+            max(
+                entero_seguro(v.get("stock", 0))
+                - entero_seguro(v.get("reservadas", 0)),
+                0,
+            )
+            for v in variantes
+            if isinstance(v, dict)
+        )
+    return max(
+        stock_de_producto(producto)
+        - entero_seguro(producto.get("reservadas", 0)),
+        0,
+    )
+
+
 def normalizar_producto(producto):
+    """Prepara los datos para las vistas sin modificar el documento original."""
     resultado = dict(producto)
     resultado.setdefault("categoria", "Sin categoría")
     resultado.setdefault("estado", "Agotado")
@@ -177,57 +267,448 @@ def normalizar_producto(producto):
     resultado["precio_original"] = precio_seguro(resultado.get("precio_original", 0))
     resultado.setdefault("descripcion", "Prenda o accesorio streetwear.")
     resultado.setdefault("imagen", "")
+
     variantes = resultado.get("variantes", [])
     if not isinstance(variantes, list):
         variantes = []
+
     variantes_limpias = []
     for variante in variantes:
-        if isinstance(variante, dict):
-            variantes_limpias.append({
-                "talla": str(variante.get("talla", "Única")),
-                "color": str(variante.get("color", "Único")),
-                "stock": entero_seguro(variante.get("stock", 0)),
-            })
+        if not isinstance(variante, dict):
+            continue
+        stock = entero_seguro(variante.get("stock", 0))
+        reservadas = entero_seguro(variante.get("reservadas", 0))
+        variantes_limpias.append({
+            "talla": str(variante.get("talla", "Única")),
+            "color": str(variante.get("color", "Único")),
+            "stock": stock,
+            "reservadas": reservadas,
+            "disponibles": max(stock - reservadas, 0),
+        })
+
     resultado["variantes"] = variantes_limpias
     resultado["stock"] = stock_de_producto(resultado)
+    resultado["reservadas"] = (
+        sum(v["reservadas"] for v in variantes_limpias)
+        if variantes_limpias
+        else entero_seguro(resultado.get("reservadas", 0))
+    )
+    resultado["stock_disponible"] = stock_disponible_de_producto(resultado)
+
+    # Agotado depende del inventario físico, no de una reserva temporal.
     resultado["estado"] = "Disponible" if resultado["stock"] > 0 else "Agotado"
-    creado = fecha_utc(resultado.get("creado_en")) or datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    creado = fecha_utc(resultado.get("creado_en")) or datetime(
+        2000, 1, 1, tzinfo=timezone.utc
+    )
     drop_at = fecha_utc(resultado.get("drop_at"))
     resultado["creado_en"] = creado
     resultado["drop_at_dt"] = drop_at
     resultado["drop_at_iso"] = drop_at.isoformat() if drop_at else ""
     resultado["drop_pendiente"] = bool(drop_at and drop_at > ahora_utc())
     resultado["es_nuevo"] = creado >= ahora_utc() - timedelta(days=14)
-    resultado["en_oferta"] = bool(resultado["precio_original"] > resultado["precio"] > 0)
-    resultado["porcentaje_descuento"] = int(round((1 - resultado["precio"] / resultado["precio_original"]) * 100)) if resultado["en_oferta"] else 0
+    resultado["en_oferta"] = bool(
+        resultado["precio_original"] > resultado["precio"] > 0
+    )
+    resultado["porcentaje_descuento"] = (
+        int(round((1 - resultado["precio"] / resultado["precio_original"]) * 100))
+        if resultado["en_oferta"]
+        else 0
+    )
     return resultado
 
 
 def inventario_variante(producto, talla="", color=""):
+    """Devuelve las unidades libres de una variante o del producto simple."""
     variantes = producto.get("variantes") or []
     if variantes:
         for variante in variantes:
-            if str(variante.get("talla", "")) == str(talla) and str(variante.get("color", "")) == str(color):
-                return entero_seguro(variante.get("stock", 0))
+            if (
+                str(variante.get("talla", "")) == str(talla)
+                and str(variante.get("color", "")) == str(color)
+            ):
+                return max(
+                    entero_seguro(variante.get("stock", 0))
+                    - entero_seguro(variante.get("reservadas", 0)),
+                    0,
+                )
         return 0
-    if producto.get("estado") != "Disponible":
-        return 0
-    if "stock" in producto:
-        return entero_seguro(producto.get("stock", 0))
-    return 10
+    return max(
+        stock_de_producto(producto)
+        - entero_seguro(producto.get("reservadas", 0)),
+        0,
+    )
 
 
 def asegurar_stock_legacy(producto):
-    if not producto.get("variantes") and "stock" not in producto:
-        inicial = 10 if producto.get("estado") == "Disponible" else 0
-        productos.update_one({"_id": producto["_id"], "stock": {"$exists": False}}, {"$set": {"stock": inicial}})
-        producto["stock"] = inicial
+    """Inicializa campos faltantes de documentos antiguos sin pisar reservas."""
+    if not producto:
+        return producto
+    if producto.get("variantes"):
+        return producto
+
+    cambios = {}
+    condiciones = {"_id": producto["_id"]}
+    if "stock" not in producto:
+        cambios["stock"] = 10 if producto.get("estado") == "Disponible" else 0
+        condiciones["stock"] = {"$exists": False}
+    if "reservadas" not in producto:
+        cambios["reservadas"] = 0
+        condiciones["reservadas"] = {"$exists": False}
+    if cambios:
+        productos.update_one(condiciones, {"$set": cambios})
+        # Releer evita sobrescribir una reserva que haya ocurrido en paralelo.
+        actualizado = productos.find_one({"_id": producto["_id"]})
+        return actualizado or producto
     return producto
+
+
+def _incrementar_reservadas_producto(producto, cantidad, talla, color, mongo_session):
+    """Aparta stock con un filtro atómico: nunca permite reservas negativas."""
+    pid = producto["_id"]
+    variantes = producto.get("variantes") or []
+    if variantes:
+        filtro = {
+            "_id": pid,
+            "estado": "Disponible",
+            "$expr": {
+                "$gt": [
+                    {
+                        "$size": {
+                            "$filter": {
+                                "input": {"$ifNull": ["$variantes", []]},
+                                "as": "v",
+                                "cond": {
+                                    "$and": [
+                                        {"$eq": ["$$v.talla", talla]},
+                                        {"$eq": ["$$v.color", color]},
+                                        {
+                                            "$gte": [
+                                                {
+                                                    "$subtract": [
+                                                        {"$ifNull": ["$$v.stock", 0]},
+                                                        {"$ifNull": ["$$v.reservadas", 0]},
+                                                    ]
+                                                },
+                                                cantidad,
+                                            ]
+                                        },
+                                    ]
+                                },
+                            }
+                        }
+                    },
+                    0,
+                ]
+            },
+        }
+        resultado = productos.update_one(
+            filtro,
+            {"$inc": {"variantes.$[v].reservadas": cantidad}},
+            array_filters=[{"v.talla": talla, "v.color": color}],
+            session=mongo_session,
+        )
+    else:
+        filtro = {
+            "_id": pid,
+            "estado": "Disponible",
+            "$expr": {
+                "$gte": [
+                    {
+                        "$subtract": [
+                            {"$ifNull": ["$stock", 0]},
+                            {"$ifNull": ["$reservadas", 0]},
+                        ]
+                    },
+                    cantidad,
+                ]
+            },
+        }
+        resultado = productos.update_one(
+            filtro,
+            {"$inc": {"reservadas": cantidad}},
+            session=mongo_session,
+        )
+    return resultado.modified_count == 1
+
+
+def _restar_reservadas_producto(producto, cantidad, talla, color, mongo_session):
+    """Devuelve al inventario unidades que estaban apartadas."""
+    if cantidad <= 0:
+        return True
+    pid = producto["_id"]
+    variantes = producto.get("variantes") or []
+    if variantes:
+        filtro = {
+            "_id": pid,
+            "variantes": {
+                "$elemMatch": {
+                    "talla": talla,
+                    "color": color,
+                    "reservadas": {"$gte": cantidad},
+                }
+            },
+        }
+        resultado = productos.update_one(
+            filtro,
+            {"$inc": {"variantes.$[v].reservadas": -cantidad}},
+            array_filters=[
+                {"v.talla": talla, "v.color": color, "v.reservadas": {"$gte": cantidad}}
+            ],
+            session=mongo_session,
+        )
+    else:
+        resultado = productos.update_one(
+            {"_id": pid, "reservadas": {"$gte": cantidad}},
+            {"$inc": {"reservadas": -cantidad}},
+            session=mongo_session,
+        )
+    return resultado.modified_count == 1
+
+
+def reservar_cantidad(producto_id, reserva_id, cantidad=1, talla="", color=""):
+    """Reserva una cantidad en Atlas y registra su vencimiento en una transacción.
+
+    Reintenta conflictos transitorios para que dos visitantes que compiten por la
+    última unidad obtengan un resultado normal: uno reserva y el otro es rechazado.
+    """
+    if not ObjectId.is_valid(str(producto_id)):
+        return False
+    cantidad = entero_seguro(cantidad, 0)
+    if cantidad < 1 or cantidad > CARRITO_MAX_CANTIDAD:
+        return False
+
+    oid = ObjectId(str(producto_id))
+    producto = productos.find_one({"_id": oid})
+    if not producto:
+        return False
+    producto = asegurar_stock_legacy(producto)
+    variantes = producto.get("variantes") or []
+    if variantes and not any(
+        str(v.get("talla", "")) == str(talla)
+        and str(v.get("color", "")) == str(color)
+        for v in variantes
+    ):
+        return False
+
+    for intento in range(3):
+        ahora = ahora_utc()
+        vence = ahora + timedelta(minutes=TIEMPO_RESERVA_MINUTOS)
+        try:
+            with cliente.start_session() as mongo_session:
+                with mongo_session.start_transaction():
+                    existente = reservas.find_one(
+                        {
+                            "reserva_id": reserva_id,
+                            "producto_id": oid,
+                            "talla": str(talla),
+                            "color": str(color),
+                            "estado": "temporal",
+                            "vence_en": {"$gt": ahora},
+                        },
+                        session=mongo_session,
+                    )
+                    if existente:
+                        cantidad_actual = entero_seguro(existente.get("cantidad", 0))
+                    else:
+                        cantidad_actual = 0
+                    if cantidad_actual + cantidad > CARRITO_MAX_CANTIDAD:
+                        return False
+
+                    producto_tx = productos.find_one({"_id": oid}, session=mongo_session)
+                    if not producto_tx:
+                        return False
+                    if not _incrementar_reservadas_producto(
+                        producto_tx, cantidad, talla, color, mongo_session
+                    ):
+                        return False
+
+                    reservas.update_one(
+                        {
+                            "reserva_id": reserva_id,
+                            "producto_id": oid,
+                            "talla": str(talla),
+                            "color": str(color),
+                            "estado": "temporal",
+                        },
+                        {
+                            "$inc": {"cantidad": cantidad},
+                            "$set": {
+                                "visitante_id": reserva_id,
+                                "recurso_id": oid,
+                                "talla": str(talla),
+                                "color": str(color),
+                                "estado": "temporal",
+                                "vence_en": vence,
+                            },
+                            "$setOnInsert": {"creada_en": ahora},
+                        },
+                        upsert=True,
+                        session=mongo_session,
+                    )
+            return True
+        except DuplicateKeyError:
+            if intento == 2:
+                raise
+        except PyMongoError as error:
+            transitorio = getattr(error, "has_error_label", lambda _label: False)(
+                "TransientTransactionError"
+            )
+            if not transitorio or intento == 2:
+                raise
+    return False
+
+
+def reservar_unidad(producto_id, reserva_id, talla="", color=""):
+    """Atajo equivalente a un clic de reserva de una unidad."""
+    return reservar_cantidad(producto_id, reserva_id, 1, talla, color)
+
+
+def liberar_reservas_vencidas():
+    """Marca vencidas y devuelve existencias mediante transacciones.
+
+    El documento se conserva en Atlas con estado ``vencida`` para el historial.
+    """
+    ahora = ahora_utc()
+    vencidas = list(
+        reservas.find({"estado": "temporal", "vence_en": {"$lte": ahora}})
+    )
+    for candidata in vencidas:
+        with cliente.start_session() as mongo_session:
+            with mongo_session.start_transaction():
+                vencida = reservas.find_one_and_update(
+                    {
+                        "_id": candidata["_id"],
+                        "estado": "temporal",
+                        "vence_en": {"$lte": ahora},
+                    },
+                    {"$set": {"estado": "vencida", "vencida_en": ahora, "liberada_en": ahora}},
+                    return_document=ReturnDocument.BEFORE,
+                    session=mongo_session,
+                )
+                if not vencida:
+                    continue
+                producto = productos.find_one(
+                    {"_id": vencida["producto_id"]},
+                    session=mongo_session,
+                )
+                if not producto:
+                    continue
+                cantidad = entero_seguro(vencida.get("cantidad", 0))
+                if not _restar_reservadas_producto(
+                    producto,
+                    cantidad,
+                    str(vencida.get("talla", "")),
+                    str(vencida.get("color", "")),
+                    mongo_session,
+                ):
+                    raise RuntimeError("No se pudo liberar el inventario de una reserva vencida.")
+
+
+def eliminar_reserva(reserva_id, producto_id, talla="", color=""):
+    """Cancela una reserva temporal y conserva su registro histórico."""
+    if not reserva_id or not ObjectId.is_valid(str(producto_id)):
+        return False
+    oid = ObjectId(str(producto_id))
+    ahora = ahora_utc()
+    with cliente.start_session() as mongo_session:
+        with mongo_session.start_transaction():
+            cancelada = reservas.find_one_and_update(
+                {
+                    "reserva_id": reserva_id,
+                    "producto_id": oid,
+                    "talla": str(talla),
+                    "color": str(color),
+                    "estado": "temporal",
+                    "vence_en": {"$gt": ahora},
+                },
+                {"$set": {"estado": "cancelada", "cancelada_en": ahora, "liberada_en": ahora}},
+                return_document=ReturnDocument.BEFORE,
+                session=mongo_session,
+            )
+            if not cancelada:
+                return False
+            producto = productos.find_one({"_id": oid}, session=mongo_session)
+            if producto:
+                cantidad = entero_seguro(cancelada.get("cantidad", 0))
+                if not _restar_reservadas_producto(
+                    producto, cantidad, str(talla), str(color), mongo_session
+                ):
+                    raise RuntimeError("No se pudo devolver el inventario al cancelar la reserva.")
+    return True
+
+
+def actualizar_reserva_cantidad(reserva_id, producto_id, nueva_cantidad, talla="", color=""):
+    """Aumenta o reduce una variante usando solo la diferencia de unidades."""
+    nueva_cantidad = entero_seguro(nueva_cantidad, 0)
+    if nueva_cantidad < 1 or nueva_cantidad > CARRITO_MAX_CANTIDAD:
+        return False
+    oid = ObjectId(str(producto_id))
+    existente = reservas.find_one({
+        "reserva_id": reserva_id,
+        "producto_id": oid,
+        "talla": str(talla),
+        "color": str(color),
+        "estado": "temporal",
+        "vence_en": {"$gt": ahora_utc()},
+    })
+    if not existente:
+        return False
+    anterior = entero_seguro(existente.get("cantidad", 0))
+    talla = str(talla)
+    color = str(color)
+    diferencia = nueva_cantidad - anterior
+    if diferencia == 0:
+        return True
+    if diferencia > 0:
+        return reservar_cantidad(oid, reserva_id, diferencia, talla, color)
+
+    liberar = -diferencia
+    ahora = ahora_utc()
+    with cliente.start_session() as mongo_session:
+        with mongo_session.start_transaction():
+            actual = reservas.find_one({
+                "reserva_id": reserva_id,
+                "producto_id": oid,
+                "talla": talla,
+                "color": color,
+                "estado": "temporal",
+                "vence_en": {"$gt": ahora},
+                "cantidad": {"$gte": liberar},
+            }, session=mongo_session)
+            if not actual:
+                return False
+            producto = productos.find_one({"_id": oid}, session=mongo_session)
+            if not producto:
+                return False
+            if not _restar_reservadas_producto(
+                producto, liberar, talla, color, mongo_session
+            ):
+                return False
+            actualizado = reservas.update_one(
+                {"_id": actual["_id"], "cantidad": anterior},
+                {
+                    "$set": {
+                        "cantidad": nueva_cantidad,
+                        "vence_en": ahora + timedelta(minutes=TIEMPO_RESERVA_MINUTOS),
+                    }
+                },
+                session=mongo_session,
+            )
+            if actualizado.modified_count != 1:
+                raise RuntimeError("La reserva cambió mientras se actualizaba la cantidad.")
+    return True
 
 
 def producto_comprable(producto):
     producto = normalizar_producto(producto)
-    return producto["estado"] == "Disponible" and not producto["drop_pendiente"] and producto["precio"] > 0
+
+    return (
+        producto["estado"] == "Disponible"
+        and producto["stock_disponible"] > 0
+        and not producto["drop_pendiente"]
+        and producto["precio"] > 0
+    )
 
 
 def parsear_variantes(texto):
@@ -253,7 +734,7 @@ def parsear_variantes(texto):
         if clave in unicas:
             abort(400, description=f"La combinación de talla y color se repite en la línea {numero}.")
         unicas.add(clave)
-        variantes.append({"talla": talla, "color": color, "stock": stock})
+        variantes.append({"talla": talla, "color": color, "stock": stock, "reservadas": 0})
     if len(variantes) > 100:
         abort(400, description="Puedes registrar hasta 100 combinaciones de talla y color por producto.")
     return variantes
@@ -338,6 +819,7 @@ def leer_formulario(datos=None):
         "imagen": imagen,
         "variantes": variantes,
         "stock": stock,
+        "reservadas": 0,
         "drop_at": drop_at,
     }
 
@@ -360,7 +842,9 @@ def producto_json(producto):
     return {
         "id": str(p["_id"]), "nombre": p["nombre"], "categoria": p["categoria"],
         "estado": p["estado"], "precio": p["precio"], "precio_original": p["precio_original"],
-        "descripcion": p["descripcion"], "imagen": p["imagen"], "stock": p["stock"],
+        "descripcion": p["descripcion"], "imagen": p["imagen"],
+        "stock": p["stock"], "reservadas": p["reservadas"],
+        "stock_disponible": p["stock_disponible"],
         "variantes": p["variantes"], "creado_en": p["creado_en"].isoformat(),
         "drop_at": p["drop_at_iso"], "drop_pendiente": p["drop_pendiente"],
     }
@@ -373,66 +857,67 @@ def leer_json():
     return leer_formulario(datos)
 
 
-def parsear_clave_carrito(clave, valor):
-    # Compatibilidad con carritos antiguos que guardaban solamente {id: cantidad}.
-    if isinstance(clave, str) and "|" in clave:
-        partes = clave.split("|", 2)
-        if len(partes) == 3:
-            return partes[0], unquote(partes[1]), unquote(partes[2])
-    if isinstance(valor, dict):
-        return str(clave), str(valor.get("talla", "")), str(valor.get("color", ""))
-    return str(clave), "", ""
-
-
-def clave_carrito(id_producto, talla="", color=""):
-    return f"{id_producto}|{quote(str(talla), safe='')}|{quote(str(color), safe='')}"
-
-
-def carrito_sesion():
-    carrito = session.get("carrito", {})
-    return carrito if isinstance(carrito, dict) else {}
-
-
 def cantidad_carrito():
-    total = 0
-    for valor in carrito_sesion().values():
-        cantidad = valor.get("cantidad", 1) if isinstance(valor, dict) else valor
-        total += min(CARRITO_MAX_CANTIDAD, entero_seguro(cantidad, 1))
-    return total
+    reserva_id = session.get("reserva_id")
+    if not reserva_id:
+        return 0
+    ahora = ahora_utc()
+    items = reservas.find({
+        "reserva_id": reserva_id,
+        "estado": "temporal",
+        "vence_en": {"$gt": ahora},
+    })
+    return sum(entero_seguro(item.get("cantidad", 0)) for item in items)
 
 
 def obtener_articulos_carrito():
-    carrito = carrito_sesion()
+    """Lee el carrito desde las reservas persistidas en MongoDB Atlas."""
+    liberar_reservas_vencidas()
+    reserva_id = session.get("reserva_id")
+    if not reserva_id:
+        return [], 0.0
+
+    ahora = ahora_utc()
+    items = list(reservas.find({
+        "reserva_id": reserva_id,
+        "estado": "temporal",
+        "vence_en": {"$gt": ahora},
+    }).sort("vence_en", 1))
+
     articulos = []
-    nuevo = {}
     total = 0.0
-    for clave, valor in carrito.items():
-        id_producto, talla, color = parsear_clave_carrito(clave, valor)
-        if not ObjectId.is_valid(id_producto):
-            continue
-        producto_raw = productos.find_one({"_id": ObjectId(id_producto)})
+    for item in items:
+        producto_raw = productos.find_one({"_id": item["producto_id"]})
         if not producto_raw:
             continue
         producto = normalizar_producto(producto_raw)
-        try:
-            cantidad = int(valor.get("cantidad", 1) if isinstance(valor, dict) else valor)
-        except (TypeError, ValueError):
-            cantidad = 1
-        cantidad = max(1, min(cantidad, CARRITO_MAX_CANTIDAD))
-        stock = inventario_variante(producto_raw, talla, color)
-        if not producto_comprable(producto_raw) or stock <= 0:
+        cantidad = entero_seguro(item.get("cantidad", 0))
+        if cantidad <= 0:
             continue
-        cantidad = min(cantidad, stock)
-        if cantidad < 1:
+
+        talla = str(item.get("talla", ""))
+        color = str(item.get("color", ""))
+        variantes = producto_raw.get("variantes") or []
+        if variantes and not any(
+            str(v.get("talla", "")) == talla
+            and str(v.get("color", "")) == color
+            for v in variantes
+        ):
+            # Protección ante datos antiguos dañados; no inventa una variante.
             continue
-        nueva_clave = clave_carrito(id_producto, talla, color)
-        nuevo[nueva_clave] = {"cantidad": cantidad, "talla": talla, "color": color}
+
         precio = producto["precio"]
         subtotal = round(precio * cantidad, 2)
-        articulos.append({**producto, "cantidad": cantidad, "talla": talla, "color": color, "linea_id": nueva_clave, "subtotal": subtotal})
+        articulos.append({
+            **producto,
+            "cantidad": cantidad,
+            "talla": talla,
+            "color": color,
+            "linea_id": str(producto["_id"]),
+            "subtotal": subtotal,
+        })
         total += subtotal
-    if nuevo != carrito:
-        session["carrito"] = nuevo
+
     return articulos, round(total, 2)
 
 
@@ -545,9 +1030,13 @@ def registro():
         except DuplicateKeyError:
             flash("Ese correo ya tiene una cuenta. Inicia sesión.", "warning")
             return redirect(url_for("login"))
-        carrito_guardado = carrito_sesion()
+        reserva_guardada = session.get("reserva_id")
+        cupon_guardado = session.get("cupon_codigo")
         session.clear()
-        session["carrito"] = carrito_guardado
+        if reserva_guardada:
+            session["reserva_id"] = reserva_guardada
+        if cupon_guardado:
+            session["cupon_codigo"] = cupon_guardado
         session["usuario_id"] = str(resultado.inserted_id)
         session.permanent = True
         g.usuario_actual = {**documento, "_id": resultado.inserted_id}
@@ -568,9 +1057,13 @@ def login():
         if not usuario or not check_password_hash(usuario.get("contrasena_hash", ""), contrasena):
             flash("El correo o la contraseña no son correctos.", "danger")
             return redirect(url_for("login", next=request.form.get("next", "")))
-        carrito_guardado = carrito_sesion()
+        reserva_guardada = session.get("reserva_id")
+        cupon_guardado = session.get("cupon_codigo")
         session.clear()
-        session["carrito"] = carrito_guardado
+        if reserva_guardada:
+            session["reserva_id"] = reserva_guardada
+        if cupon_guardado:
+            session["cupon_codigo"] = cupon_guardado
         session["usuario_id"] = str(usuario["_id"])
         session.permanent = True
         g.usuario_actual = usuario
@@ -581,6 +1074,21 @@ def login():
 
 @app.route("/salir", methods=["POST"])
 def salir():
+    liberar_reservas_vencidas()
+    reserva_id = session.get("reserva_id")
+    if reserva_id:
+        abiertas = list(reservas.find({
+            "reserva_id": reserva_id,
+            "estado": "temporal",
+            "vence_en": {"$gt": ahora_utc()},
+        }))
+        for item in abiertas:
+            eliminar_reserva(
+                reserva_id,
+                str(item["producto_id"]),
+                str(item.get("talla", "")),
+                str(item.get("color", "")),
+            )
     session.clear()
     flash("Has cerrado sesión.", "info")
     return redirect(url_for("tienda"))
@@ -620,6 +1128,7 @@ def obtener_catalogo_filtrado(args):
 
 @app.route("/")
 def tienda():
+    liberar_reservas_vencidas()
     lista, q, categoria, estado, minimo, maximo, orden = obtener_catalogo_filtrado(request.args)
     categorias = sorted([c for c in productos.distinct("categoria") if isinstance(c, str) and c.strip()])
     filtros = {"q": q, "categoria": categoria, "estado": estado, "min_precio": minimo, "max_precio": maximo, "orden": orden}
@@ -628,12 +1137,60 @@ def tienda():
 
 @app.route("/catalogo/resultados")
 def resultados_catalogo():
+    liberar_reservas_vencidas()
     lista, q, categoria, estado, minimo, maximo, orden = obtener_catalogo_filtrado(request.args)
     return render_template("_product_grid.html", productos=lista, busqueda=q, next_url=url_for("tienda") + (("?" + request.query_string.decode("utf-8")) if request.query_string else "") + "#catalogo")
 
 
+@app.route("/salud")
+@app.route("/api/salud")
+def salud():
+    """Verificación sencilla del servicio y su conexión con MongoDB Atlas."""
+    cliente.admin.command("ping")
+    return jsonify({"ok": True, "mensaje": "Tienda Estilo Moda y MongoDB Atlas funcionan."})
+
+
+def url_publica_ficha_producto(producto_id):
+    """Construye una URL pública estable para el QR (Render mediante APP_BASE_URL)."""
+    ruta = url_for("ficha_publica", id=str(producto_id))
+    base = os.environ.get("APP_BASE_URL", "").strip().rstrip("/")
+    if base:
+        return f"{base}{ruta}"
+    return url_for("ficha_publica", id=str(producto_id), _external=True)
+
+
+@app.route("/qr/producto/<id>.png")
+def qr_producto(id):
+    producto = buscar_producto(id)
+    url_ficha = url_publica_ficha_producto(producto["_id"])
+    imagen = qrcode.make(url_ficha, box_size=8, border=4)
+    salida = BytesIO()
+    imagen.save(salida, format="PNG")
+    salida.seek(0)
+    respuesta = send_file(
+        salida,
+        mimetype="image/png",
+        download_name=f"TSM-QR-{producto['_id']}.png",
+        max_age=300,
+    )
+    respuesta.headers["X-Content-Type-Options"] = "nosniff"
+    return respuesta
+
+
+@app.route("/ficha/<id>")
+def ficha_publica(id):
+    liberar_reservas_vencidas()
+    producto = buscar_producto(id)
+    return render_template(
+        "ficha_publica.html",
+        producto=producto,
+        url_ficha=url_publica_ficha_producto(producto["_id"]),
+    )
+
+
 @app.route("/producto/<id>")
 def detalle_producto(id):
+    liberar_reservas_vencidas()
     producto = buscar_producto(id)
     relacionados = [normalizar_producto(p) for p in productos.find({"categoria": producto.get("categoria")}).limit(8) if str(p.get("_id")) != str(producto.get("_id"))][:4]
     lista_resenas = list(resenas.find({"producto_id": str(producto["_id"]), "visible": True}).sort("creado_en", -1).limit(30))
@@ -683,32 +1240,70 @@ def alternar_favorito(id):
 # -------------------------------- CARRITO -----------------------------------
 @app.route("/carrito")
 def ver_carrito():
+    liberar_reservas_vencidas()
     articulos, subtotal = obtener_articulos_carrito()
-    cupon, descuento = descuento_cupon(subtotal, str(usuario_actual()["_id"]) if usuario_actual() else None)
-    return render_template("carrito.html", articulos=articulos, total=subtotal, subtotal=subtotal, cupon=cupon, descuento=descuento, total_final=round(subtotal-descuento, 2))
+    reserva_id = session.get("reserva_id")
+    items = list(reservas.find({
+        "reserva_id": reserva_id,
+        "estado": "temporal",
+        "vence_en": {"$gt": ahora_utc()},
+    })) if reserva_id else []
+    fechas = [fecha_utc(item.get("vence_en")) for item in items]
+    fechas = [fecha for fecha in fechas if fecha is not None]
+    vence_en = min(fechas, default=None)
+
+    usuario = usuario_actual()
+    cupon, descuento = descuento_cupon(
+        subtotal,
+        str(usuario["_id"]) if usuario else None,
+    )
+    return render_template(
+        "carrito.html",
+        articulos=articulos,
+        total=subtotal,
+        subtotal=subtotal,
+        cupon=cupon,
+        descuento=descuento,
+        total_final=round(subtotal - descuento, 2),
+        vence_en=vence_en,
+    )
 
 
 @app.route("/carrito/agregar/<id>", methods=["POST"])
 def agregar_carrito(id):
-    producto_raw = productos.find_one({"_id": ObjectId(id)}) if ObjectId.is_valid(id) else None
+    liberar_reservas_vencidas()
+    if not ObjectId.is_valid(id):
+        abort(404)
+
+    producto_raw = productos.find_one({"_id": ObjectId(id)})
     if not producto_raw:
         abort(404, description="Este producto no existe.")
+    producto_raw = asegurar_stock_legacy(producto_raw)
     producto = normalizar_producto(producto_raw)
+
     if producto["drop_pendiente"]:
-        flash("Este drop todavía no está disponible.", "warning")
-        return redirect(url_for("detalle_producto", id=id))
-    if not producto_comprable(producto_raw):
-        flash("Este producto no está disponible para comprar.", "warning")
+        flash("Este producto todavía no está disponible.", "warning")
         return redirect(url_for("detalle_producto", id=id))
     if producto["precio"] <= 0:
-        flash("El administrador debe asignar un precio antes de vender este producto.", "warning")
+        flash("Este producto no tiene precio disponible.", "warning")
         return redirect(url_for("detalle_producto", id=id))
+    if not producto_comprable(producto_raw):
+        if producto["stock"] > 0:
+            flash("Sin disponibilidad temporal: otras personas reservaron las unidades disponibles.", "warning")
+        else:
+            flash("Este producto está agotado.", "warning")
+        return redirect(url_for("detalle_producto", id=id))
+
     talla = request.form.get("talla", "").strip()
     color = request.form.get("color", "").strip()
     variantes = producto.get("variantes", [])
-    if variantes and not any(v["talla"] == talla and v["color"] == color for v in variantes):
-        flash("Selecciona una combinación válida de talla y color.", "warning")
+    if variantes and not any(
+        v["talla"] == talla and v["color"] == color
+        for v in variantes
+    ):
+        flash("Selecciona una talla y color válidos.", "warning")
         return redirect(url_for("detalle_producto", id=id))
+
     try:
         cantidad = int(request.form.get("cantidad", "1"))
     except (TypeError, ValueError):
@@ -716,54 +1311,62 @@ def agregar_carrito(id):
     if cantidad < 1 or cantidad > CARRITO_MAX_CANTIDAD:
         flash(f"La cantidad debe estar entre 1 y {CARRITO_MAX_CANTIDAD}.", "warning")
         return redirect(url_for("detalle_producto", id=id))
-    producto_raw = asegurar_stock_legacy(producto_raw)
-    stock = inventario_variante(producto_raw, talla, color)
-    clave = clave_carrito(id, talla, color)
-    carrito = carrito_sesion()
-    valor_anterior = carrito.get(clave, {})
-    cantidad_anterior = entero_seguro(valor_anterior.get("cantidad", 0) if isinstance(valor_anterior, dict) else valor_anterior)
-    nueva = cantidad_anterior + cantidad
-    if nueva > stock:
-        flash(f"Solo hay {stock} unidad(es) disponibles de esta combinación.", "warning")
-        return redirect(url_for("detalle_producto", id=id))
-    if nueva > CARRITO_MAX_CANTIDAD:
-        flash(f"Puedes agregar máximo {CARRITO_MAX_CANTIDAD} unidades por combinación.", "warning")
-        return redirect(url_for("ver_carrito"))
-    carrito[clave] = {"cantidad": nueva, "talla": talla, "color": color}
-    session["carrito"] = carrito
-    flash(f"{producto['nombre']} se agregó al carrito.", "success")
+
+    reserva_id = obtener_reserva_id()
+    reservado = reservar_cantidad(id, reserva_id, cantidad, talla, color)
+    if reservado:
+        flash(
+            f"Producto reservado durante {TIEMPO_RESERVA_MINUTOS} minutos.",
+            "success",
+        )
+    else:
+        flash(
+            "No hay suficientes unidades disponibles para completar esa reserva.",
+            "warning",
+        )
     return redirect(url_for("ver_carrito"))
 
 
 @app.route("/carrito/actualizar", methods=["POST"])
 def actualizar_carrito():
-    clave = request.form.get("linea_id", "")
-    carrito = carrito_sesion()
-    if clave not in carrito:
+    liberar_reservas_vencidas()
+    reserva_id = session.get("reserva_id")
+    producto_id = request.form.get("linea_id", "").strip()
+    if not reserva_id or not ObjectId.is_valid(producto_id):
+        flash("No se encontró la reserva que quieres actualizar.", "warning")
         return redirect(url_for("ver_carrito"))
-    pid, talla, color = parsear_clave_carrito(clave, carrito[clave])
     try:
         cantidad = int(request.form.get("cantidad", "1"))
     except (TypeError, ValueError):
         cantidad = 1
-    producto = productos.find_one({"_id": ObjectId(pid)}) if ObjectId.is_valid(pid) else None
     if cantidad < 1 or cantidad > CARRITO_MAX_CANTIDAD:
         flash(f"La cantidad debe estar entre 1 y {CARRITO_MAX_CANTIDAD}.", "warning")
-    elif not producto or cantidad > inventario_variante(producto, talla, color):
-        flash("La cantidad supera las existencias disponibles.", "warning")
+        return redirect(url_for("ver_carrito"))
+
+    talla = request.form.get("talla", "").strip()
+    color = request.form.get("color", "").strip()
+    if actualizar_reserva_cantidad(reserva_id, producto_id, cantidad, talla, color):
+        flash("Cantidad reservada actualizada correctamente.", "success")
     else:
-        carrito[clave] = {"cantidad": cantidad, "talla": talla, "color": color}
-        session["carrito"] = carrito
-        flash("Cantidad actualizada.", "success")
+        flash("No se pudo actualizar la reserva: revisa las existencias disponibles o vuelve a reservar.", "warning")
     return redirect(url_for("ver_carrito"))
 
 
 @app.route("/carrito/eliminar", methods=["POST"])
 def eliminar_carrito():
-    carrito = carrito_sesion()
-    carrito.pop(request.form.get("linea_id", ""), None)
-    session["carrito"] = carrito
-    flash("Producto eliminado del carrito.", "info")
+    liberar_reservas_vencidas()
+    reserva_id = session.get("reserva_id")
+    producto_id = request.form.get("linea_id", "").strip()
+    if not reserva_id or not ObjectId.is_valid(producto_id):
+        flash("No se encontró la reserva.", "warning")
+        return redirect(url_for("ver_carrito"))
+
+    talla = request.form.get("talla", "").strip()
+    color = request.form.get("color", "").strip()
+    if eliminar_reserva(reserva_id, producto_id, talla, color):
+        flash("Reserva cancelada y producto liberado.", "success")
+    else:
+        flash("La reserva ya venció o no existe.", "warning")
     return redirect(url_for("ver_carrito"))
 
 
@@ -771,6 +1374,7 @@ def eliminar_carrito():
 @app.route("/checkout/cupon", methods=["POST"])
 @requiere_login
 def aplicar_cupon():
+    liberar_reservas_vencidas()
     _, subtotal = obtener_articulos_carrito()
     codigo = request.form.get("codigo", "").strip().upper()
     cupon = cupones.find_one({"codigo": codigo}) if codigo else None
@@ -795,6 +1399,7 @@ def quitar_cupon():
 @app.route("/checkout")
 @requiere_login
 def checkout():
+    liberar_reservas_vencidas()
     articulos, subtotal = obtener_articulos_carrito()
     if not articulos:
         flash("Tu carrito está vacío o sus productos dejaron de estar disponibles.", "info")
@@ -806,82 +1411,184 @@ def checkout():
 @app.route("/checkout/confirmar", methods=["POST"])
 @requiere_login
 def confirmar_checkout():
-    articulos, subtotal = obtener_articulos_carrito()
-    if not articulos:
-        flash("Tu carrito está vacío.", "warning")
+    liberar_reservas_vencidas()
+    reserva_id = session.get("reserva_id")
+    if not reserva_id:
+        flash("Tu reserva ya no está activa. Agrega nuevamente los productos.", "warning")
         return redirect(url_for("ver_carrito"))
+
     usuario = usuario_actual()
     metodo = request.form.get("metodo_pago", "tarjeta_demo")
     if metodo not in METODOS_PAGO:
         flash("Selecciona un método de pago de demostración válido.", "warning")
         return redirect(url_for("checkout"))
-    cupon, descuento = descuento_cupon(subtotal, str(usuario["_id"]))
-    ahora = ahora_utc()
-    descontados = []
-    detalle = []
-    # Volver a comprobar y reservar existencias justo al confirmar el pedido.
-    for item in articulos:
-        pid = item["_id"]
-        cantidad = item["cantidad"]
-        raw = productos.find_one({"_id": pid})
-        if not raw or not producto_comprable(raw):
-            for revertir in reversed(descontados):
-                if revertir["variantes"]:
-                    productos.update_one({"_id": revertir["id"]}, {"$inc": {"variantes.$[v].stock": revertir["cantidad"]}}, array_filters=[{"v.talla": revertir["talla"], "v.color": revertir["color"]}])
-                else:
-                    productos.update_one({"_id": revertir["id"]}, {"$inc": {"stock": revertir["cantidad"]}, "$set": {"estado": "Disponible"}})
-            flash("Un producto dejó de estar disponible. Revisa el carrito.", "warning")
-            return redirect(url_for("ver_carrito"))
-        raw = asegurar_stock_legacy(raw)
-        variantes = raw.get("variantes") or []
-        talla, color = item.get("talla", ""), item.get("color", "")
-        if variantes:
-            resultado = productos.update_one(
-                {"_id": pid, "variantes": {"$elemMatch": {"talla": talla, "color": color, "stock": {"$gte": cantidad}}}},
-                {"$inc": {"variantes.$.stock": -cantidad}},
-            )
-            usado_variante = True
-        else:
-            resultado = productos.update_one({"_id": pid, "stock": {"$gte": cantidad}, "estado": "Disponible"}, {"$inc": {"stock": -cantidad}})
-            usado_variante = False
-        if resultado.modified_count != 1:
-            for revertir in reversed(descontados):
-                if revertir["variantes"]:
-                    productos.update_one({"_id": revertir["id"]}, {"$inc": {"variantes.$[v].stock": revertir["cantidad"]}}, array_filters=[{"v.talla": revertir["talla"], "v.color": revertir["color"]}])
-                else:
-                    productos.update_one({"_id": revertir["id"]}, {"$inc": {"stock": revertir["cantidad"]}, "$set": {"estado": "Disponible"}})
-            flash("No quedan suficientes existencias para una de tus selecciones. Revisa el carrito.", "warning")
-            return redirect(url_for("ver_carrito"))
-        descontados.append({"id": pid, "cantidad": cantidad, "variantes": usado_variante, "talla": talla, "color": color})
-        recargado = productos.find_one({"_id": pid})
-        nuevo_total_stock = stock_de_producto(recargado or {})
-        productos.update_one({"_id": pid}, {"$set": {"estado": "Disponible" if nuevo_total_stock > 0 else "Agotado"}})
-        detalle.append({"producto_id": str(pid), "nombre": item["nombre"], "categoria": item["categoria"], "cantidad": cantidad, "precio_unitario": item["precio"], "subtotal": item["subtotal"], "talla": talla, "color": color})
 
-    total_final = round(max(0, subtotal - descuento), 2)
-    pedido = {
-        "cliente": {"nombre": usuario.get("nombre", "Cliente"), "correo": usuario.get("correo", "")},
-        "usuario_id": str(usuario["_id"]), "items": detalle,
-        "subtotal": subtotal, "descuento": descuento, "cupon_codigo": cupon.get("codigo") if cupon else "",
-        "total": total_final, "metodo_pago": METODOS_PAGO[metodo],
-        "estado_pago": "DEMO: no se realizó ningún cobro", "estado_pedido": "Recibido", "creado_en": ahora,
-    }
+    ahora = ahora_utc()
+    pedido_id = None
+    subtotal = 0.0
+    descuento = 0.0
+    cupon_usado = None
     try:
-        resultado_pedido = pedidos.insert_one(pedido)
-    except PyMongoError:
-        # Si no se pudo guardar el pedido, devuelve el inventario reservado.
-        for revertir in reversed(descontados):
-            if revertir["variantes"]:
-                productos.update_one({"_id": revertir["id"]}, {"$inc": {"variantes.$[v].stock": revertir["cantidad"]}}, array_filters=[{"v.talla": revertir["talla"], "v.color": revertir["color"]}])
-            else:
-                productos.update_one({"_id": revertir["id"]}, {"$inc": {"stock": revertir["cantidad"]}, "$set": {"estado": "Disponible"}})
-        raise
-    if cupon:
-        cupones.update_one({"_id": cupon["_id"]}, {"$inc": {"usos": 1}, "$addToSet": {"usuarios_que_lo_usaron": str(usuario["_id"])}})
-    session["carrito"] = {}
+        with cliente.start_session() as mongo_session:
+            with mongo_session.start_transaction():
+                items_reservados = list(reservas.find({
+                    "reserva_id": reserva_id,
+                    "estado": "temporal",
+                    "vence_en": {"$gt": ahora},
+                }, session=mongo_session))
+                if not items_reservados:
+                    raise ValueError("La reserva venció o ya no contiene productos.")
+
+                detalle = []
+                for reserva in items_reservados:
+                    pid = reserva["producto_id"]
+                    cantidad = entero_seguro(reserva.get("cantidad", 0))
+                    talla = str(reserva.get("talla", ""))
+                    color = str(reserva.get("color", ""))
+                    if cantidad < 1:
+                        raise ValueError("Una de las reservas no contiene una cantidad válida.")
+
+                    producto = productos.find_one({"_id": pid}, session=mongo_session)
+                    if not producto:
+                        raise ValueError("Uno de los productos reservados ya no existe.")
+                    variantes = producto.get("variantes") or []
+                    if variantes:
+                        filtro = {
+                            "_id": pid,
+                            "variantes": {
+                                "$elemMatch": {
+                                    "talla": talla,
+                                    "color": color,
+                                    "stock": {"$gte": cantidad},
+                                    "reservadas": {"$gte": cantidad},
+                                }
+                            },
+                        }
+                        resultado = productos.update_one(
+                            filtro,
+                            {
+                                "$inc": {
+                                    "variantes.$[v].stock": -cantidad,
+                                    "variantes.$[v].reservadas": -cantidad,
+                                }
+                            },
+                            array_filters=[{
+                                "v.talla": talla,
+                                "v.color": color,
+                                "v.stock": {"$gte": cantidad},
+                                "v.reservadas": {"$gte": cantidad},
+                            }],
+                            session=mongo_session,
+                        )
+                    else:
+                        # Una reserva activa ya inicializó stock y reservadas para este producto.
+                        resultado = productos.update_one(
+                            {
+                                "_id": pid,
+                                "stock": {"$gte": cantidad},
+                                "reservadas": {"$gte": cantidad},
+                            },
+                            {
+                                "$inc": {
+                                    "stock": -cantidad,
+                                    "reservadas": -cantidad,
+                                }
+                            },
+                            session=mongo_session,
+                        )
+                    if resultado.modified_count != 1:
+                        raise ValueError("Una reserva ya no coincide con el inventario. No se creó el pedido.")
+
+                    producto_actualizado = productos.find_one({"_id": pid}, session=mongo_session)
+                    stock_restante = stock_de_producto(producto_actualizado or {})
+                    productos.update_one(
+                        {"_id": pid},
+                        {"$set": {"estado": "Disponible" if stock_restante > 0 else "Agotado"}},
+                        session=mongo_session,
+                    )
+
+                    precio = precio_seguro(producto.get("precio", 0))
+                    subtotal_item = round(precio * cantidad, 2)
+                    subtotal += subtotal_item
+                    detalle.append({
+                        "producto_id": str(pid),
+                        "nombre": producto.get("nombre", "Producto"),
+                        "categoria": producto.get("categoria", "Sin categoría"),
+                        "cantidad": cantidad,
+                        "precio_unitario": precio,
+                        "subtotal": subtotal_item,
+                        "talla": talla,
+                        "color": color,
+                    })
+
+                subtotal = round(subtotal, 2)
+                codigo_cupon = str(session.get("cupon_codigo", "") or "").strip().upper()
+                if codigo_cupon:
+                    cupon = cupones.find_one({"codigo": codigo_cupon}, session=mongo_session)
+                    valido, _mensaje = es_cupon_valido(
+                        cupon, subtotal, str(usuario["_id"])
+                    )
+                    if valido:
+                        valor = precio_seguro(cupon.get("valor", 0))
+                        if cupon.get("tipo") == "porcentaje":
+                            descuento = subtotal * min(valor, 100) / 100
+                        else:
+                            descuento = min(valor, subtotal)
+                        descuento = round(min(subtotal, max(0, descuento)), 2)
+                        cupon_usado = cupon
+
+                pedido = {
+                    "cliente": {
+                        "nombre": usuario.get("nombre", "Cliente"),
+                        "correo": usuario.get("correo", ""),
+                    },
+                    "usuario_id": str(usuario["_id"]),
+                    "items": detalle,
+                    "subtotal": subtotal,
+                    "descuento": descuento,
+                    "cupon_codigo": cupon_usado.get("codigo") if cupon_usado else "",
+                    "total": round(max(0, subtotal - descuento), 2),
+                    "metodo_pago": METODOS_PAGO[metodo],
+                    "estado_pago": "DEMO: no se realizó ningún cobro",
+                    "estado_pedido": "Recibido",
+                    "creado_en": ahora,
+                }
+                resultado_pedido = pedidos.insert_one(pedido, session=mongo_session)
+                reservas_confirmadas = reservas.update_many(
+                    {
+                        "reserva_id": reserva_id,
+                        "estado": "temporal",
+                        "vence_en": {"$gt": ahora},
+                    },
+                    {"$set": {
+                        "estado": "confirmada",
+                        "confirmada_en": ahora,
+                        "pedido_id": resultado_pedido.inserted_id,
+                    }},
+                    session=mongo_session,
+                )
+                if reservas_confirmadas.matched_count != len(items_reservados):
+                    raise ValueError("Las reservas cambiaron durante la confirmación. Inténtalo nuevamente.")
+                if cupon_usado:
+                    cupones.update_one(
+                        {"_id": cupon_usado["_id"]},
+                        {
+                            "$inc": {"usos": 1},
+                            "$addToSet": {"usuarios_que_lo_usaron": str(usuario["_id"])},
+                        },
+                        session=mongo_session,
+                    )
+                pedido_id = resultado_pedido.inserted_id
+    except ValueError as error:
+        liberar_reservas_vencidas()
+        flash(str(error), "warning")
+        return redirect(url_for("ver_carrito"))
+
+    session.pop("reserva_id", None)
+    session.pop("carrito", None)
     session.pop("cupon_codigo", None)
     flash("Pedido de demostración creado. No se realizó ningún cobro.", "success")
-    return redirect(url_for("confirmacion_compra", id=str(resultado_pedido.inserted_id)))
+    return redirect(url_for("confirmacion_compra", id=str(pedido_id)))
 
 
 @app.route("/compra/confirmacion/<id>")
@@ -949,9 +1656,83 @@ def guardar_resena(id):
 
 
 # ------------------------------ ADMIN ---------------------------------------
+def preservar_reservas_en_edicion(datos, producto_actual):
+    """No permite que el formulario administrativo borre unidades ya apartadas."""
+    anteriores = producto_actual.get("variantes") or []
+    nuevas = datos.get("variantes") or []
+    anteriores_por_clave = {
+        (str(v.get("talla", "")), str(v.get("color", ""))): v
+        for v in anteriores
+        if isinstance(v, dict)
+    }
+
+    if anteriores and nuevas:
+        nuevas_procesadas = []
+        claves_nuevas = set()
+        for variante in nuevas:
+            clave = (str(variante.get("talla", "")), str(variante.get("color", "")))
+            anterior = anteriores_por_clave.get(clave, {})
+            reservadas = entero_seguro(anterior.get("reservadas", 0))
+            if entero_seguro(variante.get("stock", 0)) < reservadas:
+                abort(400, description=f"No puedes bajar el stock de {clave[0]} / {clave[1]} por debajo de sus {reservadas} unidad(es) reservadas.")
+            nuevas_procesadas.append({**variante, "reservadas": reservadas})
+            claves_nuevas.add(clave)
+        for clave, anterior in anteriores_por_clave.items():
+            reservadas = entero_seguro(anterior.get("reservadas", 0))
+            if reservadas and clave not in claves_nuevas:
+                abort(400, description=f"No puedes eliminar la variante {clave[0]} / {clave[1]} porque tiene {reservadas} unidad(es) reservadas.")
+        datos["variantes"] = nuevas_procesadas
+        datos["stock"] = sum(v["stock"] for v in nuevas_procesadas)
+        datos["reservadas"] = sum(v["reservadas"] for v in nuevas_procesadas)
+
+    elif anteriores and not nuevas:
+        reservadas_anteriores = sum(
+            entero_seguro(v.get("reservadas", 0)) for v in anteriores
+            if isinstance(v, dict)
+        )
+        if reservadas_anteriores:
+            abort(400, description="No puedes cambiar a inventario simple mientras existan variantes reservadas.")
+        datos["reservadas"] = 0
+
+    elif not anteriores and nuevas:
+        reservadas_anteriores = entero_seguro(producto_actual.get("reservadas", 0))
+        if reservadas_anteriores:
+            abort(400, description="No puedes convertir a variantes mientras haya unidades simples reservadas.")
+        datos["variantes"] = [{**v, "reservadas": 0} for v in nuevas]
+        datos["stock"] = sum(v["stock"] for v in datos["variantes"])
+        datos["reservadas"] = 0
+
+    else:
+        reservadas = entero_seguro(producto_actual.get("reservadas", 0))
+        if entero_seguro(datos.get("stock", 0)) < reservadas:
+            abort(400, description=f"No puedes reducir las existencias por debajo de las {reservadas} unidad(es) reservadas.")
+        datos["reservadas"] = reservadas
+
+    datos["estado"] = "Disponible" if entero_seguro(datos.get("stock", 0)) > 0 else "Agotado"
+    return datos
+
+
+def actualizar_producto_preservando_reservas(producto_id, datos):
+    """Actualiza inventario en transacción para no pisar reservas simultáneas."""
+    with cliente.start_session() as mongo_session:
+        with mongo_session.start_transaction():
+            actual = productos.find_one({"_id": producto_id}, session=mongo_session)
+            if not actual:
+                return False
+            datos_seguros = preservar_reservas_en_edicion(dict(datos), actual)
+            datos_seguros["creado_en"] = actual.get("creado_en", ahora_utc())
+            resultado = productos.update_one(
+                {"_id": producto_id},
+                {"$set": datos_seguros},
+                session=mongo_session,
+            )
+            return resultado.matched_count == 1
+
+
 @app.route("/admin", endpoint="inicio")
 @requiere_admin
 def panel_admin():
+    liberar_reservas_vencidas()
     lista_raw = list(productos.find().sort("nombre", 1))
     lista = [normalizar_producto(p) for p in lista_raw]
     total_ventas = sum(precio_seguro(p.get("total", 0)) for p in pedidos.find({}, {"total": 1}))
@@ -981,11 +1762,13 @@ def agregar():
 @app.route("/editar/<id>", methods=["GET", "POST"])
 @requiere_admin
 def editar(id):
+    liberar_reservas_vencidas()
     producto = buscar_producto(id)
     if request.method == "POST":
         datos = leer_formulario()
-        datos["creado_en"] = productos.find_one({"_id": producto["_id"]}).get("creado_en", ahora_utc())
-        productos.update_one({"_id": producto["_id"]}, {"$set": datos})
+        if not actualizar_producto_preservando_reservas(producto["_id"], datos):
+            flash("El producto ya no existe o no se pudo actualizar.", "warning")
+            return redirect(url_for("inicio") + "#lista")
         flash("Producto actualizado.", "success")
         return redirect(url_for("inicio") + "#lista")
     variantes_texto = "\n".join(f"{v['talla']} | {v['color']} | {v['stock']}" for v in producto.get("variantes", []))
@@ -995,7 +1778,11 @@ def editar(id):
 @app.route("/eliminar/<id>", methods=["POST"])
 @requiere_admin
 def eliminar(id):
+    liberar_reservas_vencidas()
     producto = buscar_producto(id)
+    if reservas.count_documents({"producto_id": producto["_id"], "estado": "temporal"}):
+        flash("No puedes eliminar este producto mientras tenga reservas activas.", "warning")
+        return redirect(url_for("inicio") + "#lista")
     productos.delete_one({"_id": producto["_id"]})
     resenas.delete_many({"producto_id": str(producto["_id"])})
     flash("Producto eliminado del inventario.", "info")
@@ -1096,6 +1883,7 @@ def ayuda():
 # -------------------------------- API JSON ----------------------------------
 @app.route("/api/catalogo", methods=["GET"])
 def api_catalogo():
+    liberar_reservas_vencidas()
     lista, *_ = obtener_catalogo_filtrado(request.args)
     return jsonify([producto_json(p) for p in lista[:100]])
 
@@ -1103,6 +1891,7 @@ def api_catalogo():
 @app.route("/api/productos", methods=["GET", "POST"])
 def api_productos():
     if request.method == "POST":
+        liberar_reservas_vencidas()
         if not usuario_actual():
             return jsonify({"error": "Inicia sesión como administrador para crear productos."}), 401
         if not es_administrador():
@@ -1117,6 +1906,7 @@ def api_productos():
 
 @app.route("/api/productos/<id>", methods=["GET", "PUT", "DELETE"])
 def api_producto(id):
+    liberar_reservas_vencidas()
     producto = buscar_producto(id)
     if request.method == "PUT":
         if not usuario_actual():
@@ -1124,13 +1914,16 @@ def api_producto(id):
         if not es_administrador():
             return jsonify({"error": "No tienes permisos para modificar el inventario."}), 403
         datos = leer_json()
-        productos.update_one({"_id": producto["_id"]}, {"$set": datos})
+        if not actualizar_producto_preservando_reservas(producto["_id"], datos):
+            return jsonify({"error": "El producto ya no existe o no se pudo actualizar."}), 409
         return jsonify(producto_json(buscar_producto(id)))
     if request.method == "DELETE":
         if not usuario_actual():
             return jsonify({"error": "Inicia sesión como administrador para eliminar productos."}), 401
         if not es_administrador():
             return jsonify({"error": "No tienes permisos para modificar el inventario."}), 403
+        if reservas.count_documents({"producto_id": producto["_id"], "estado": "temporal"}):
+            return jsonify({"error": "No se puede eliminar un producto con reservas activas."}), 409
         productos.delete_one({"_id": producto["_id"]})
         return "", 204
     return jsonify(producto_json(producto))

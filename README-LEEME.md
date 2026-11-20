@@ -10,7 +10,10 @@ Actualización funcional del proyecto Tienda Estilo Moda. Conserva las coleccion
 - Favoritos guardados por usuario.
 - Variantes por talla/color con stock, validación del inventario y descuento de existencias al crear un pedido de demostración.
 - Etiquetas NUEVO/SALE/AGOTADO y lanzamientos con cuenta regresiva.
-- Carrito con múltiples combinaciones de talla/color.
+- Carrito con reservas temporales de 5 minutos guardadas en MongoDB.
+- Bloqueo atómico de inventario para que dos visitantes no reserven la última unidad.
+- Cancelación, vencimiento, ajuste de cantidad y checkout con transacciones.
+- Compatibilidad con inventario simple y variantes por talla/color.
 - Checkout simulado: no procesa cobros ni recopila información de tarjetas.
 - Historial de pedidos para clientes y gestión del estado de pedido para administración.
 - Cupones de porcentaje/cantidad fija, vigencia opcional, compra mínima y límite de usos.
@@ -22,18 +25,24 @@ Actualización funcional del proyecto Tienda Estilo Moda. Conserva las coleccion
 
 1. Detén Flask con `Ctrl+C`.
 2. Haz una copia de seguridad de la carpeta `belleza-ana`.
-3. Extrae los archivos del paquete dentro de `belleza-ana` y reemplaza los archivos de igual nombre. **No reemplaces ni borres `.git`, `.venv` o `.env`.**
+3. Copia los archivos del paquete dentro de `belleza-ana` y reemplaza los archivos de igual nombre. **No reemplaces ni borres `.git`, `.venv` o `.env`.**
 4. Comprueba que el archivo `.env` local conserva tu `MONGO_URI` y `SECRET_KEY`. No uses los valores de ejemplo como secretos reales.
-5. En la terminal de VS Code, dentro de `belleza-ana`, ejecuta:
+5. Comprueba que MongoDB sea Atlas o un replica set local: las transacciones requeridas por las reservas no funcionan en una instancia standalone.
+6. Ejecuta una sola vez `python migrar_inventario_reservas.py` para inicializar los campos `reservadas`. Los productos antiguos sin `stock` reciben 10 solo como valor temporal de prueba; cámbialo por el inventario real. Consulta `INSTRUCCIONES_RESERVA_TEMPORAL.md`.
+7. En la terminal de VS Code, dentro de `belleza-ana`, ejecuta:
 
    ```powershell
    .\.venv\Scripts\python.exe -m pip install -r requirements.txt
    .\.venv\Scripts\python.exe app.py
    ```
 
-6. Abre `http://127.0.0.1:5000/`.
+8. Abre `http://127.0.0.1:5000/`.
 
 La cuenta administradora existente se conserva si el usuario en MongoDB tiene `rol: "admin"`. El registro de nuevas cuentas será como cliente cuando ya exista un administrador.
+
+## Reservas temporales
+
+El carrito se almacena en la colección `reservas`. Para cada carrito, producto y combinación talla/color se guarda una reserva activa con cantidad y hora de vencimiento. Un mismo carrito puede reservar varias variantes del mismo producto. Cuando se cancela o vencen los 5 minutos se libera el stock; al confirmar el pedido se descuentan las existencias físicas y se elimina la reserva. La guía completa de pruebas y evidencias está en `INSTRUCCIONES_RESERVA_TEMPORAL.md`.
 
 ## Variantes de inventario
 
